@@ -8,7 +8,7 @@ trước và sau core.
 |---|---|---|
 | STT streaming | `gemini-3.5-transcribe-live` ([docs](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)) | Google Live API, service làm relay WebSocket (API key không lộ ra client) |
 | STT batch | `gemini-3.5-transcribe` ([docs](https://ai.google.dev/gemini-api/docs/transcribe)) | Google API, audio gửi inline |
-| TTS | VieNeu-TTS v3 Turbo, 48 kHz | Local, tự chọn thiết bị: có GPU NVIDIA → PyTorch/CUDA; không có → ONNX Runtime int8 trên CPU |
+| TTS | VieNeu-TTS v3 Turbo, 48 kHz **hoặc** `gemini-3.8-flash-lite-tts`, 24 kHz ([docs](https://ai.google.dev/gemini-api/docs/speech-generation)) | `TTS_BACKEND=auto`: có GPU NVIDIA → VieNeu local (PyTorch/CUDA, fp32); không có → Gemini TTS. Xem [Chọn backend TTS](#chọn-backend-tts) |
 
 ```
 Browser (mic, PCM 16 kHz) ──WS /v1/stt/stream──▶ interim… final ──▶ Browser/Gateway ──candidate_answer──▶ core (WS)
@@ -84,14 +84,14 @@ Header: `X-Audio-Duration` (giây, không tính phần đệm), `X-Latency-Ms`, 
 ### `POST /v1/tts/stream` — JSON như `/v1/tts` (khuyên dùng cho hội thoại)
 
 Trả PCM thô `audio/pcm` (s16le, mono) theo từng đoạn ngay khi VieNeu sinh ra; header `X-Sample-Rate`
-(48000 với Turbo, 24000 với Nano), `X-Channels`, `X-Sample-Format`, `X-Voice`. Có cùng phần đệm im lặng
+(48000 với VieNeu Turbo, 24000 với Nano và Gemini TTS), `X-Channels`, `X-Sample-Format`, `X-Voice`. Có cùng phần đệm im lặng
 như `/v1/tts`. Lỗi kiểm tra đầu vào (400/413/422/503) trả về trước khi stream bắt đầu. Câu đã sinh được
 cache, lần sau trả ngay. Client phát bằng Web Audio, xếp lịch từng đoạn nối tiếp nhau (xem `ttsStream`
 trong `app/static/index.html`).
 
 ### `GET /v1/tts/voices`
 
-Danh sách giọng preset của VieNeu (`id` dùng cho trường `voice`).
+Danh sách giọng preset của backend đang chạy (`id` dùng cho trường `voice`).
 
 ### Mã lỗi
 
@@ -99,9 +99,28 @@ Danh sách giọng preset của VieNeu (`id` dùng cho trường `voice`).
 `422` giọng/mode không hợp lệ · `502`/`504` Gemini lỗi hoặc quá thời gian · `503` thiếu
 `GEMINI_API_KEY` hoặc VieNeu không tải được.
 
-## TTS trên CPU và GPU
+## Chọn backend TTS
 
-`TTS_DEVICE=auto` (mặc định): nếu cài PyTorch có CUDA (`uv sync --extra cuda`) và thấy GPU NVIDIA thì
+Đặt `TTS_BACKEND` trong `.env`:
+
+| Giá trị | Kết quả |
+|---|---|
+| `auto` (mặc định, hoặc bỏ trống) | PyTorch thấy GPU NVIDIA → VieNeu trên CUDA với cấu hình cao nhất (Turbo 48 kHz, `TTS_GPU_DTYPE=float32`, batch 32, 16 luồng stream). Không có GPU → Gemini TTS |
+| `vieneu` | Luôn dùng VieNeu local; `TTS_DEVICE` (`auto`/`cpu`/`cuda`) chọn thiết bị, như mục dưới |
+| `gemini` | Luôn dùng Gemini TTS (`GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`, `GEMINI_TTS_STYLE`), cần `GEMINI_API_KEY` |
+
+"Có GPU" nghĩa là đã `uv sync --extra cuda` và `torch.cuda.is_available()` là `True`. Máy có GPU NVIDIA
+nhưng chưa cài torch CUDA thì service vẫn chọn Gemini và ghi cảnh báo vào log. `/health` → `tts.provider`
+cho biết backend đang chạy.
+
+Gemini TTS: giọng là bộ preset của Gemini (`Kore`, `Puck`, …; `GET /v1/tts/voices`), không phải giọng
+VieNeu. `/v1/tts/stream` trả PCM 24 kHz (`X-Sample-Rate: 24000`), cùng phần đệm im lặng và cache như VieNeu.
+Đo một lần trên máy này (flash-lite): âm đầu tiên ~2,8 s, câu ~3 s audio xong trong ~4,8 s, chậm hơn nhiều
+so với VieNeu local (~0,2 s âm đầu).
+
+## TTS trên CPU và GPU (VieNeu)
+
+Khi dùng VieNeu với `TTS_DEVICE=auto`: nếu cài PyTorch có CUDA (`uv sync --extra cuda`) và thấy GPU NVIDIA thì
 chạy như trước (PyTorch, batching, stream scheduler cho nhiều luồng cùng lúc); nếu không thì chạy ONNX
 Runtime trên CPU với các tối ưu:
 
@@ -142,5 +161,6 @@ Test dùng Gemini giả (`httpx.MockTransport`, Live API giả) và VieNeu giả
 ## Cấu hình
 
 Xem `.env.example`. Các biến chính: `GEMINI_API_KEY`, `STT_LIVE_MODEL`, `STT_LIVE_FINAL_TIMEOUT_SEC`, `STT_MODEL`, `STT_LANGUAGE_CODES`, `STT_MODE`,
-`TTS_MODEL`, `TTS_VOICE`, `TTS_DEVICE` (`auto` | `cpu` | `cuda`), `TTS_CPU_PRECISION`, `TTS_CPU_THREADS`, `TTS_PRELOAD`,
+`TTS_BACKEND` (`auto` | `vieneu` | `gemini`), `GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`, `GEMINI_TTS_STYLE`,
+`TTS_MODEL`, `TTS_VOICE`, `TTS_DEVICE` (`auto` | `cpu` | `cuda`), `TTS_CPU_PRECISION`, `TTS_CPU_THREADS`, `TTS_GPU_DTYPE`, `TTS_PRELOAD`,
 `SERVICE_TOKEN`, `CORS_ORIGINS`.

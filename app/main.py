@@ -1,4 +1,4 @@
-"""Speech service: STT (Gemini transcribe API) + TTS (local VieNeu), plus a small test page."""
+"""Speech service: STT (Gemini transcribe API) + TTS (local VieNeu or Gemini TTS), plus a small test page."""
 from __future__ import annotations
 
 import asyncio
@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from app.config import Settings, get_settings, split_csv
 from app.stt import GeminiTranscriber, SttError, resolve_mime_type
 from app.stt_live import Connector, connect_gemini_live, relay_stream
-from app.tts import TtsError, VieneuSynthesizer
+from app.tts import GeminiSynthesizer, TtsError, VieneuSynthesizer, create_synthesizer
 
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -37,10 +37,10 @@ class SttResponse(BaseModel):
 
 
 def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber | None = None,
-               synthesizer: VieneuSynthesizer | None = None, live_connector: Connector | None = None) -> FastAPI:
+               synthesizer: VieneuSynthesizer | GeminiSynthesizer | None = None, live_connector: Connector | None = None) -> FastAPI:
     settings = settings or get_settings()
     transcriber = transcriber or GeminiTranscriber(settings)
-    synthesizer = synthesizer or VieneuSynthesizer(settings)
+    synthesizer = synthesizer or create_synthesizer(settings)
     live_connector = live_connector or connect_gemini_live
 
     @asynccontextmanager
@@ -81,7 +81,7 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
             "stt": {"provider": "gemini", "model": settings.stt_model, "live_model": settings.stt_live_model,
                     "configured": transcriber.configured,
                     "language_codes": settings.language_codes, "mode": settings.stt_mode},
-            "tts": {"provider": "vieneu", "model": settings.tts_model, "device": synthesizer.device,
+            "tts": {"provider": synthesizer.provider, "model": synthesizer.model_name, "device": synthesizer.device,
                     "backend": synthesizer.backend, "cpu_precision": settings.tts_cpu_precision,
                     "state": synthesizer.state, "error": synthesizer.error,
                     "default_voice": synthesizer.default_voice},
@@ -116,7 +116,7 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
     @app.post("/v1/tts/stream", dependencies=[Depends(require_token)],
               responses={200: {"content": {"audio/pcm": {}}}})
     async def text_to_speech_stream(request: TtsRequest):
-        """Raw PCM s16le mono chunks while VieNeu generates; sample rate in X-Sample-Rate."""
+        """Raw PCM s16le mono chunks while the backend generates; sample rate in X-Sample-Rate."""
         cancel = threading.Event()
         voice = request.voice or synthesizer.default_voice
         chunks = _iterate_in_thread(lambda: synthesizer.stream(request.text, request.voice, cancel))
@@ -165,7 +165,7 @@ async def _iterate_in_thread(make_iterator):
         yield item
 
 
-def _preload(synthesizer: VieneuSynthesizer) -> None:
+def _preload(synthesizer: VieneuSynthesizer | GeminiSynthesizer) -> None:
     try:
         synthesizer.load()
     except TtsError:

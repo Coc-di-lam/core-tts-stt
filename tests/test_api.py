@@ -11,7 +11,8 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import create_app
 from app.stt import GeminiTranscriber
-from app.tts import LEADING_PAD_SEC, TRAILING_PAD_SEC, VieneuSynthesizer
+from app.tts import (LEADING_PAD_SEC, TRAILING_PAD_SEC, GeminiSynthesizer, VieneuSynthesizer,
+                     create_synthesizer)
 
 
 class FakeVieneu:
@@ -196,7 +197,7 @@ def test_auto_device_without_torch_is_cpu(monkeypatch):
 
 @pytest.mark.parametrize("device,expected", [
     ("cpu", {"mode": "v3turbo", "device": "cpu", "precision": "int8", "threads": 0}),
-    ("cuda", {"mode": "v3turbo", "device": "cuda", "max_batch_size": 32, "max_streams": 16}),
+    ("cuda", {"mode": "v3turbo", "device": "cuda", "dtype": "float32", "max_batch_size": 32, "max_streams": 16}),
 ])
 def test_engine_options_per_device(monkeypatch, device, expected):
     import vieneu
@@ -207,3 +208,100 @@ def test_engine_options_per_device(monkeypatch, device, expected):
     synthesizer.load()
     assert captured == expected
     assert synthesizer.state == "ready" and synthesizer.default_voice == "Hải Đăng"
+
+
+# ---- Gemini TTS backend ----
+
+def _pcm(seconds, rate=24_000):
+    return (np.full(int(rate * seconds), 0.1, dtype=np.float32) * 32767).astype("<i2").tobytes()
+
+
+def make_gemini_client(handler, **overrides):
+    settings = Settings(_env_file=None, gemini_api_key="test-key", tts_preload=False, tts_backend="gemini",
+                        **overrides)
+    synthesizer = GeminiSynthesizer(settings, httpx.Client(transport=httpx.MockTransport(handler)))
+    transcriber = GeminiTranscriber(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    return TestClient(create_app(settings, transcriber, synthesizer))
+
+
+def test_gemini_tts_whole_clip_request_and_cache():
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        data = base64.b64encode(_pcm(1.0)).decode()
+        return httpx.Response(200, json={"steps": [{"type": "model_output",
+                                                    "content": [{"type": "audio", "data": data}]}]})
+
+    client = make_gemini_client(handler, gemini_tts_style="calm")
+    first = client.post("/v1/tts", json={"text": "Xin chào", "voice": "Puck"})
+    second = client.post("/v1/tts", json={"text": "Xin chào", "voice": "Puck"})
+
+    assert first.status_code == 200
+    data, rate = sf.read(io.BytesIO(first.content))
+    assert rate == 24_000
+    assert float(first.headers["X-Audio-Duration"]) == pytest.approx(1.0)
+    assert second.headers["X-Cache-Hit"] == "true" and len(calls) == 1
+    assert calls[0] == {
+        "model": "gemini-3.8-flash-lite-tts",
+        "input": [{"type": "user_input", "content": [{"type": "text", "text": "Xin chào", "annotations": [
+            {"type": "speech_metadata", "style": "calm"}]}]}],
+        "response_format": {"type": "audio", "mime_type": "audio/l16", "sample_rate": 24_000},
+        "generation_config": {"speech_config": [{"voice": "Puck"}]},
+    }
+
+
+def test_gemini_tts_stream_reassembles_split_samples():
+    pcm = _pcm(0.5)
+    split = 1001  # odd: one sample straddles two deltas
+
+    def handler(request):
+        assert json.loads(request.content)["stream"] is True
+        events = [{"event_type": "step.start", "index": 1, "step": {"type": "model_output"}}]
+        events += [{"event_type": "step.delta", "index": 1,
+                    "delta": {"type": "audio", "data": base64.b64encode(chunk).decode()}}
+                   for chunk in (pcm[:split], pcm[split:])]
+        events.append({"event_type": "interaction.completed", "interaction": {"status": "completed"}})
+        body = "".join(f"event: {e['event_type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+        return httpx.Response(200, text=body + "event: done\ndata: [DONE]\n\n",
+                              headers={"content-type": "text/event-stream"})
+
+    client = make_gemini_client(handler)
+    response = client.post("/v1/tts/stream", json={"text": "Xin chào"})
+
+    assert response.status_code == 200 and response.headers["X-Sample-Rate"] == "24000"
+    lead, trail = int(24_000 * LEADING_PAD_SEC) * 2, int(24_000 * TRAILING_PAD_SEC) * 2
+    assert response.content[lead:len(response.content) - trail] == pcm
+    assert response.headers["X-Voice"] == "Kore"
+
+
+def test_gemini_tts_errors_surface_before_streaming():
+    client = make_gemini_client(lambda request: httpx.Response(400, json={"error": {"message": "bad voice"}}))
+    response = client.post("/v1/tts/stream", json={"text": "Xin chào", "voice": "Nope"})
+    assert response.status_code == 400 and "bad voice" in response.json()["detail"]
+    assert client.post("/v1/tts", json={"text": "Xin chào"}).status_code == 400
+
+
+def test_gemini_tts_health_and_voices():
+    client = make_gemini_client(lambda request: httpx.Response(200))
+    tts = client.get("/health").json()["tts"]
+    assert tts["provider"] == "gemini" and tts["model"] == "gemini-3.8-flash-lite-tts" and tts["state"] == "ready"
+    voices = client.get("/v1/tts/voices").json()
+    assert voices["default"] == "Kore" and {"id": "Puck", "label": "Puck"} in voices["voices"]
+
+
+@pytest.mark.parametrize("backend,cuda,expected", [
+    ("auto", True, VieneuSynthesizer),
+    ("auto", False, GeminiSynthesizer),
+    ("vieneu", False, VieneuSynthesizer),
+    ("gemini", True, GeminiSynthesizer),
+])
+def test_backend_selection(monkeypatch, backend, cuda, expected):
+    import app.tts as tts
+
+    monkeypatch.setattr(tts, "resolve_device", lambda setting: "cuda" if cuda or setting == "cuda" else "cpu")
+    synthesizer = create_synthesizer(Settings(_env_file=None, gemini_api_key="k", tts_backend=backend,
+                                              tts_device="cpu" if backend == "vieneu" else "auto"))
+    assert type(synthesizer) is expected
+    if backend == "auto" and cuda:
+        assert synthesizer.device == "cuda"

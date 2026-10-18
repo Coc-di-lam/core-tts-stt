@@ -458,7 +458,7 @@ async function loadVoices() {
   $("voice").innerHTML = "";
   for (const v of data.voices) {
     const opt = new Option(v.label, v.id);
-    opt.selected = v.id === (saved || data.default);
+    opt.selected = v.id === (data.voices.some((x) => x.id === saved) ? saved : data.default);
     $("voice").append(opt);
   }
 }
@@ -470,7 +470,7 @@ async function refreshHealth() {
     const h = await (await fetch("/health")).json();
     const pills = [
       [`STT · ${h.stt.live_model} / ${h.stt.model}`, h.stt.configured ? "ok" : "err", h.stt.configured ? "" : " (thiếu GEMINI_API_KEY)"],
-      [`TTS · VieNeu ${h.tts.device}${h.tts.device === "cpu" ? " " + h.tts.cpu_precision : ""}`, { ready: "ok", loading: "warn", idle: "warn", error: "err" }[h.tts.state], ` (${h.tts.state})`],
+      [h.tts.provider === "gemini" ? `TTS · Gemini ${h.tts.model}` : `TTS · VieNeu ${h.tts.device}${h.tts.device === "cpu" ? " " + h.tts.cpu_precision : ""}`, { ready: "ok", loading: "warn", idle: "warn", error: "err" }[h.tts.state], ` (${h.tts.state})`],
     ];
     if (h.auth_required) pills.push(["Cần service token", "warn", ""]);
     $("pills").innerHTML = "";
