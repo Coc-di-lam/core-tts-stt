@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speech Service Test</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #16181d; --muted: #646b78; --line: #e2e5ea;
+    --accent: #2563eb; --accent-text: #ffffff; --rec: #dc2626; --ok: #15803d; --warn: #b45309; --err: #b91c1c;
+    --code: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #171a21; --text: #e7e9ee; --muted: #9aa2b1; --line: #2a2f3a;
+      --accent: #3b82f6; --rec: #ef4444; --ok: #22c55e; --warn: #f59e0b; --err: #f87171; --code: #1f232c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; }
+  .pill { font-size: 13px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); }
+  .pill.ok::before, .pill.warn::before, .pill.err::before { content: "●"; margin-right: 6px; }
+  .pill.ok::before { color: var(--ok); } .pill.warn::before { color: var(--warn); } .pill.err::before { color: var(--err); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+  select, input, textarea { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+                            border-radius: 8px; padding: 7px 10px; min-width: 0; }
+  textarea { width: 100%; resize: vertical; min-height: 80px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--bg); color: var(--text);
+           border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .rec-btn { width: 100%; padding: 18px; font-size: 17px; font-weight: 600; margin: 14px 0; }
+  .rec-btn.recording { background: var(--rec); border-color: var(--rec); color: #fff; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .75; } }
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+  .step { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .step .k { font-size: 12px; color: var(--muted); }
+  .step .v { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .step.active { border-color: var(--accent); }
+  .transcript { background: var(--code); border-radius: 8px; padding: 10px 12px; min-height: 44px; white-space: pre-wrap; }
+  .muted { color: var(--muted); font-size: 13px; }
+  audio { width: 100%; margin-top: 10px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .log { font: 12px/1.6 ui-monospace, Consolas, monospace; background: var(--code); border-radius: 8px; padding: 10px;
+         max-height: 220px; overflow: auto; white-space: pre-wrap; }
+  .err-text { color: var(--err); }
+  .interim { color: var(--muted); }
+  label.check { flex-direction: row; align-items: center; gap: 6px; padding-bottom: 8px; }
+  .vad { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 4px; background: var(--line); }
+  .vad.on { background: var(--ok); }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } .steps { grid-template-columns: repeat(2, 1fr); } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Speech Service Test</h1>
+    <div class="pills" id="pills"><span class="pill">Đang kiểm tra /health…</span></div>
+  </header>
+
+  <section class="card">
+    <h2>Vòng lặp: thu âm → STT live → TTS → nói lại</h2>
+    <div class="row">
+      <label>Giọng TTS <select id="voice"></select></label>
+      <label>Ngôn ngữ STT
+        <select id="language">
+          <option value="vi-VN">vi-VN</option><option value="en-US">en-US</option>
+          <option value="vi-VN,en-US">vi-VN + en-US</option><option value="auto">Tự nhận diện</option>
+        </select>
+      </label>
+      <label>Chế độ STT
+        <select id="mode"><option value="smart">smart</option><option value="verbatim">verbatim</option></select>
+      </label>
+      <label style="flex:1;min-width:180px">Từ vựng riêng (phân tách bằng dấu phẩy)
+        <input id="vocabulary" placeholder="Kubernetes, FastAPI, Redis">
+      </label>
+      <label>Service token <input id="token" type="password" placeholder="nếu có" autocomplete="off"></label>
+      <label class="check"><input type="checkbox" id="autoStop"> Tự dừng khi Gemini thấy hết nói</label>
+      <label class="check"><input type="checkbox" id="ttsStream" checked> TTS streaming</label>
+    </div>
+    <button class="rec-btn primary" id="recBtn">🎙 Bấm để nói</button>
+    <div class="steps">
+      <div class="step" id="s-rec"><div class="k">Thu âm <span id="vadDot" class="vad"></span></div><div class="v">–</div></div>
+      <div class="step" id="s-stt"><div class="k">STT (dừng → final)</div><div class="v">–</div></div>
+      <div class="step" id="s-tts"><div class="k">TTS (âm đầu tiên / cả câu)</div><div class="v">–</div></div>
+      <div class="step" id="s-total"><div class="k">Tổng (dừng nói → nghe tiếng)</div><div class="v">–</div></div>
+    </div>
+    <div class="muted">Transcript <span id="liveInfo"></span></div>
+    <div class="transcript" id="loopText"></div>
+    <div class="grid2">
+      <div><div class="muted" style="margin-top:10px">Bản thu gốc</div><audio id="loopIn" controls></audio></div>
+      <div><div class="muted" style="margin-top:10px">TTS nói lại</div><audio id="loopOut" controls></audio></div>
+    </div>
+  </section>
+
+  <div class="grid2">
+    <section class="card">
+      <h2>POST /v1/stt <span class="muted">(batch, upload file)</span></h2>
+      <div class="row">
+        <input type="file" id="sttFile" accept="audio/*,.webm" style="flex:1">
+        <button id="sttBtn" class="primary">Nhận dạng</button>
+      </div>
+      <div class="muted" style="margin:10px 0 4px">Kết quả</div>
+      <div class="transcript" id="sttOut"></div>
+    </section>
+    <section class="card">
+      <h2>POST /v1/tts <span class="muted">(hoặc /v1/tts/stream)</span></h2>
+      <textarea id="ttsText">Xin chào, mình là dịch vụ chuyển văn bản thành giọng nói. Bạn nghe có rõ không?</textarea>
+      <div class="row" style="margin-top:10px">
+        <button id="ttsBtn" class="primary">Đọc</button>
+        <span class="muted" id="ttsInfo"></span>
+      </div>
+      <audio id="ttsOut" controls></audio>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Nhật ký request</h2>
+    <div class="log" id="log"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+for (const id of ["token", "language", "mode", "vocabulary", "autoStop", "ttsStream"]) {
+  if ($(id).type === "checkbox") {
+    const saved = store.get("speech." + id);
+    if (saved) $(id).checked = saved === "1";
+    $(id).addEventListener("change", () => store.set("speech." + id, $(id).checked ? "1" : "0"));
+    continue;
+  }
+  const saved = store.get("speech." + id);
+  if (saved) $(id).value = saved;
+  $(id).addEventListener("change", () => store.set("speech." + id, $(id).value));
+}
+
+function authHeaders() {
+  const token = $("token").value.trim();
+  return token ? { Authorization: "Bearer " + token } : {};
+}
+function log(line, isError = false) {
+  const time = new Date().toLocaleTimeString();
+  const el = document.createElement("div");
+  if (isError) el.className = "err-text";
+  el.textContent = `[${time}] ${line}`;
+  $("log").prepend(el);
+}
+async function errorText(res) {
+  try { return (await res.json()).detail || res.statusText; } catch { return res.statusText; }
+}
+
+async function stt(blob, filename) {
+  const form = new FormData();
+  form.append("file", blob, filename);
+  form.append("language", $("language").value);
+  form.append("mode", $("mode").value);
+  if ($("vocabulary").value.trim()) form.append("vocabulary", $("vocabulary").value);
+  const t0 = performance.now();
+  const res = await fetch("/v1/stt", { method: "POST", body: form, headers: authHeaders() });
+  const ms = performance.now() - t0;
+  if (!res.ok) { const msg = await errorText(res); log(`STT ${res.status} ${msg}`, true); throw new Error(msg); }
+  const data = await res.json();
+  log(`STT 200 ${(blob.size / 1024).toFixed(0)} KB → "${data.text.slice(0, 60)}" (client ${ms.toFixed(0)} ms, Gemini ${data.latency_ms} ms)`);
+  return { ...data, clientMs: ms };
+}
+
+async function tts(text) {
+  const t0 = performance.now();
+  const res = await fetch("/v1/tts", {
+    method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ text, voice: $("voice").value || null }),
+  });
+  const ms = performance.now() - t0;
+  if (!res.ok) { const msg = await errorText(res); log(`TTS ${res.status} ${msg}`, true); throw new Error(msg); }
+  const blob = await res.blob();
+  const duration = res.headers.get("X-Audio-Duration");
+  const cacheHit = res.headers.get("X-Cache-Hit") === "true";
+  log(`TTS 200 ${text.length} ký tự → ${duration}s audio (${ms.toFixed(0)} ms${cacheHit ? ", cache" : ""})`);
+  return { blob, ms, duration };
+}
+
+function setStep(id, value, active = false) {
+  $(id).querySelector(".v").textContent = value;
+  $(id).classList.toggle("active", active);
+}
+const fmt = (ms) => ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : ms.toFixed(0) + " ms";
+
+// ---- Live loop: mic → PCM16 16 kHz over WS /v1/stt/stream → final → /v1/tts ----
+// AudioWorklet downsamples the mic to 16 kHz and posts 100 ms Int16 frames.
+const WORKLET = `
+class Pcm16k extends AudioWorkletProcessor {
+  constructor() { super(); this.ratio = sampleRate / 16000; this.pos = 0; this.out = new Int16Array(1600); this.n = 0; this.prev = 0; }
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      while (this.pos <= i) {
+        const a = i === 0 ? this.prev : ch[i - 1], f = this.pos - (i - 1);
+        const s = Math.max(-1, Math.min(1, a + (ch[i] - a) * f));
+        this.out[this.n++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        if (this.n === this.out.length) { this.port.postMessage(this.out.buffer, [this.out.buffer]); this.out = new Int16Array(1600); this.n = 0; }
+        this.pos += this.ratio;
+      }
+    }
+    this.pos -= ch.length; this.prev = ch[ch.length - 1];
+    return true;
+  }
+}
+registerProcessor("pcm16k", Pcm16k);`;
+
+let live = null;  // {ws, ctx, stream, frames, stoppedAt, timer}
+
+function setTranscript(text, cls = "") {
+  $("loopText").innerHTML = "";
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = text;
+  $("loopText").append(span);
+}
+
+function resetButton() {
+  $("recBtn").disabled = false;
+  $("recBtn").classList.remove("recording");
+  $("recBtn").textContent = "🎙 Bấm để nói";
+}
+
+async function startLive() {
+  if (!navigator.mediaDevices?.getUserMedia) { log("Trình duyệt không hỗ trợ thu âm (cần https hoặc localhost).", true); return; }
+  $("recBtn").disabled = true;
+  ["s-rec", "s-stt", "s-tts", "s-total"].forEach((id) => setStep(id, "–"));
+  setTranscript("");
+  $("liveInfo").textContent = "";
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
+  } catch (e) { log("Không mở được micro: " + e.message, true); resetButton(); return; }
+
+  const t0 = performance.now();
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/v1/stt/stream`);
+  ws.binaryType = "arraybuffer";
+  // Capture starts now; frames recorded before "ready" are buffered and flushed then,
+  // so words spoken right after the click are not lost while Gemini sets up (~0.6 s).
+  live = { ws, stream, frames: [], sent: 0, ready: false, stoppedAt: null, finished: false };
+  ws.onopen = () => ws.send(JSON.stringify({
+    type: "start", language: $("language").value, mode: $("mode").value,
+    vocabulary: $("vocabulary").value, token: $("token").value.trim() || undefined,
+  }));
+  ws.onmessage = (e) => onLiveMessage(JSON.parse(e.data), t0);
+  ws.onclose = () => { if (live?.ws === ws && !live.finished) { teardown(); resetButton(); } };
+  try { await startCapture(); } catch (e) { log("Không bắt đầu thu được: " + e.message, true); teardown(); resetButton(); }
+}
+
+function flushFrames() {
+  while (live.sent < live.frames.length) live.ws.send(live.frames[live.sent++].buffer);
+}
+
+async function onLiveMessage(msg, t0) {
+  if (!live) return;
+  if (msg.type === "ready") {
+    $("liveInfo").textContent = `· ${msg.model} · kết nối ${fmt(performance.now() - t0)}`;
+    log(`WS ready ${msg.model} (Gemini setup ${msg.setup_ms} ms, gửi bù ${live.frames.length * 100} ms audio đã thu)`);
+    live.ready = true;
+    flushFrames();
+    if (live.stoppedAt) live.ws.send(JSON.stringify({ type: "end" }));
+  } else if (msg.type === "interim") {
+    setTranscript(msg.text, "interim");
+  } else if (msg.type === "vad") {
+    $("vadDot").classList.toggle("on", msg.event === "start");
+    if (msg.event === "end" && $("autoStop").checked && !live.stoppedAt) stopLive();
+  } else if (msg.type === "final") {
+    live.finished = true;
+    const sttMs = performance.now() - live.stoppedAt;
+    setStep("s-stt", fmt(sttMs));
+    log(`STT live final "${msg.text.slice(0, 60)}" (${fmt(sttMs)} sau khi dừng, relay ${msg.latency_ms} ms)`);
+    const stoppedAt = live.stoppedAt;
+    live.ws.send(JSON.stringify({ type: "stop" }));
+    teardown();
+    await speakBack(msg.text, stoppedAt);
+  } else if (msg.type === "error") {
+    log("STT live: " + msg.detail, true);
+    setTranscript(msg.detail, "err-text");
+  }
+}
+
+async function startCapture() {
+  const ctx = new AudioContext();
+  live.ctx = ctx;
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" }));
+  await ctx.audioWorklet.addModule(url);
+  const node = new AudioWorkletNode(ctx, "pcm16k");
+  node.port.onmessage = (e) => {
+    if (!live || live.stoppedAt) return;
+    live.frames.push(new Int16Array(e.data));
+    if (live.ready) flushFrames();
+  };
+  ctx.createMediaStreamSource(live.stream).connect(node);
+  live.startedAt = performance.now();
+  live.timer = setInterval(() => setStep("s-rec", fmt(performance.now() - live.startedAt), true), 100);
+  $("recBtn").disabled = false;
+  $("recBtn").classList.add("recording");
+  $("recBtn").textContent = "■ Đang nghe… bấm để dừng";
+}
+
+function stopLive() {
+  if (!live || live.stoppedAt || !live.startedAt) return;
+  live.stoppedAt = performance.now();
+  clearInterval(live.timer);
+  setStep("s-rec", fmt(live.stoppedAt - live.startedAt));
+  setStep("s-stt", "…", true);
+  live.stream.getTracks().forEach((t) => t.stop());
+  $("loopIn").src = URL.createObjectURL(pcmToWav(live.frames));
+  if (live.ready) live.ws.send(JSON.stringify({ type: "end" }));  // else sent once "ready" arrives
+  $("recBtn").classList.remove("recording");
+  $("recBtn").textContent = "Đang xử lý…";
+  $("recBtn").disabled = true;
+}
+
+function teardown() {
+  if (!live) return;
+  clearInterval(live.timer);
+  live.stream?.getTracks().forEach((t) => t.stop());
+  live.ctx?.close().catch(() => {});
+  if (live.ws.readyState <= WebSocket.OPEN) live.ws.close();
+  $("vadDot").classList.remove("on");
+  live = null;
+}
+
+async function speakBack(text, stoppedAt) {
+  try {
+    if (!text) { setTranscript("(không nghe thấy lời nói)", "muted"); return; }
+    setTranscript(text);
+    setStep("s-tts", "…", true);
+    if ($("ttsStream").checked) {
+      const speech = await ttsStream(text, () => setStep("s-total", fmt(performance.now() - stoppedAt)));
+      setStep("s-tts", `${fmt(speech.firstMs)} / ${fmt(speech.ms)}`);
+      $("loopOut").src = URL.createObjectURL(speech.blob);
+    } else {
+      const speech = await tts(text);
+      setStep("s-tts", `${fmt(speech.ms)} / ${fmt(speech.ms)}`);
+      $("loopOut").src = URL.createObjectURL(speech.blob);
+      await $("loopOut").play().catch(() => {});
+      setStep("s-total", fmt(performance.now() - stoppedAt));
+    }
+  } catch (e) {
+    setTranscript(e.message, "err-text");
+    $("s-tts").classList.remove("active");
+  } finally {
+    resetButton();
+  }
+}
+
+// Streams /v1/tts/stream and schedules each PCM chunk on Web Audio as soon as it arrives.
+async function ttsStream(text, onFirstAudio) {
+  const t0 = performance.now();
+  const res = await fetch("/v1/tts/stream", {
+    method: "POST", headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ text, voice: $("voice").value || null }),
+  });
+  if (!res.ok) { const msg = await errorText(res); log(`TTS stream ${res.status} ${msg}`, true); throw new Error(msg); }
+  const rate = Number(res.headers.get("X-Sample-Rate")) || 48000;
+  const padSamples = Math.round(rate * 0.15);  // leading silence the service prepends
+  const ctx = new AudioContext();
+  await ctx.resume();
+  const reader = res.body.getReader();
+  const parts = [];
+  let next = ctx.currentTime + 0.05, received = 0, firstMs = null, carry = null;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    let bytes = value;
+    if (carry) { bytes = new Uint8Array(carry.length + value.length); bytes.set(carry); bytes.set(value, carry.length); }
+    const even = bytes.length - (bytes.length % 2);
+    carry = even < bytes.length ? bytes.slice(even) : null;
+    if (!even) continue;
+    const pcm = new Int16Array(bytes.slice(0, even).buffer);
+    parts.push(pcm);
+    received += pcm.length;
+    const buffer = ctx.createBuffer(1, pcm.length, rate);
+    buffer.copyToChannel(Float32Array.from(pcm, (v) => v / 32768), 0);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    next = Math.max(next, ctx.currentTime);
+    source.start(next);
+    next += buffer.duration;
+    if (firstMs === null && received > padSamples) { firstMs = performance.now() - t0; onFirstAudio?.(); }
+  }
+  const ms = performance.now() - t0;
+  setTimeout(() => ctx.close().catch(() => {}), Math.max(0, next - ctx.currentTime) * 1000 + 500);
+  log(`TTS stream ${(received / rate).toFixed(2)}s audio · âm đầu ${fmt(firstMs ?? ms)} · xong ${fmt(ms)}`);
+  return { blob: pcmToWav(parts, rate), firstMs: firstMs ?? ms, ms, duration: (received / rate).toFixed(2) };
+}
+
+function pcmToWav(frames, rate = 16000) {
+  const samples = frames.reduce((n, f) => n + f.length, 0);
+  const view = new DataView(new ArrayBuffer(44 + samples * 2));
+  const str = (o, s) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)));
+  str(0, "RIFF"); view.setUint32(4, 36 + samples * 2, true); str(8, "WAVEfmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true); str(36, "data"); view.setUint32(40, samples * 2, true);
+  let o = 44;
+  for (const f of frames) for (const s of f) { view.setInt16(o, s, true); o += 2; }
+  return new Blob([view], { type: "audio/wav" });
+}
+
+$("recBtn").addEventListener("click", () => live?.startedAt ? stopLive() : startLive());
+
+// ---- Single endpoints ----
+$("sttBtn").addEventListener("click", async () => {
+  const file = $("sttFile").files[0];
+  if (!file) { log("Chọn một file audio trước.", true); return; }
+  $("sttBtn").disabled = true; $("sttOut").textContent = "…";
+  try {
+    const r = await stt(file, file.name);
+    $("sttOut").textContent = `${r.text}\n\n— ${r.model} · ${r.mode} · ${r.language_codes.join(", ") || "auto"} · ${r.latency_ms} ms`;
+  } catch (e) { $("sttOut").textContent = "Lỗi: " + e.message; }
+  finally { $("sttBtn").disabled = false; }
+});
+
+$("ttsBtn").addEventListener("click", async () => {
+  const text = $("ttsText").value.trim();
+  if (!text) return;
+  $("ttsBtn").disabled = true; $("ttsInfo").textContent = "Đang tạo…";
+  try {
+    if ($("ttsStream").checked) {
+      const s = await ttsStream(text);
+      $("ttsOut").src = URL.createObjectURL(s.blob);
+      $("ttsInfo").textContent = `${s.duration}s audio · âm đầu ${fmt(s.firstMs)} · xong ${fmt(s.ms)}`;
+    } else {
+      const s = await tts(text);
+      $("ttsOut").src = URL.createObjectURL(s.blob);
+      $("ttsOut").play().catch(() => {});
+      $("ttsInfo").textContent = `${s.duration}s audio · ${fmt(s.ms)}`;
+    }
+  } catch (e) { $("ttsInfo").textContent = "Lỗi: " + e.message; }
+  finally { $("ttsBtn").disabled = false; }
+});
+
+// ---- Health + voices ----
+async function loadVoices() {
+  const res = await fetch("/v1/tts/voices", { headers: authHeaders() });
+  if (!res.ok) { log(`Voices ${res.status} ${await errorText(res)}`, true); return; }
+  const data = await res.json();
+  const saved = store.get("speech.voice");
+  $("voice").innerHTML = "";
+  for (const v of data.voices) {
+    const opt = new Option(v.label, v.id);
+    opt.selected = v.id === (saved || data.default);
+    $("voice").append(opt);
+  }
+}
+$("voice").addEventListener("change", () => store.set("speech.voice", $("voice").value));
+
+let voicesLoaded = false;
+async function refreshHealth() {
+  try {
+    const h = await (await fetch("/health")).json();
+    const pills = [
+      [`STT · ${h.stt.live_model} / ${h.stt.model}`, h.stt.configured ? "ok" : "err", h.stt.configured ? "" : " (thiếu GEMINI_API_KEY)"],
+      [`TTS · VieNeu ${h.tts.device}${h.tts.device === "cpu" ? " " + h.tts.cpu_precision : ""}`, { ready: "ok", loading: "warn", idle: "warn", error: "err" }[h.tts.state], ` (${h.tts.state})`],
+    ];
+    if (h.auth_required) pills.push(["Cần service token", "warn", ""]);
+    $("pills").innerHTML = "";
+    for (const [text, cls, extra] of pills) {
+      const el = document.createElement("span");
+      el.className = "pill " + cls; el.textContent = text + extra;
+      $("pills").append(el);
+    }
+    if ((h.tts.state === "ready" || h.tts.state === "idle") && !voicesLoaded) { voicesLoaded = true; loadVoices(); }
+    if (h.tts.state !== "ready" && h.tts.state !== "error") setTimeout(refreshHealth, 2000);
+  } catch (e) {
+    $("pills").innerHTML = '<span class="pill err">Không kết nối được service</span>';
+    setTimeout(refreshHealth, 3000);
+  }
+}
+$("token").addEventListener("change", () => { voicesLoaded = false; refreshHealth(); });
+refreshHealth();
+</script>
+</body>
+</html>

@@ -1,52 +1,19 @@
-# Node
-node_modules/
-.next/
-out/
-build/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
+.pytest_cache/
+.venv/
 venv/
-ENV/
 build/
 dist/
 *.egg-info/
-.pytest_cache/
 
 # Environments
 .env
 .env.local
 .env.*.local
 
-# Models & Large Binaries
-backend/models/laya/*.pt
-backend/models/laya/*.onnx
-frontend/public/models/*.onnx
-frontend/public/models/*.bin
-!frontend/public/models/silero_vad.onnx
-frontend/public/models/ort/*.wasm
-
 # IDE
 .vscode/
 .idea/
 *.swp
-*.swo
-
-# Runtime & Cache
-.cache/
-backend/.cache/
-*.log
-.kilo/
-.kilocode/
-
-# Local CV/job/framework dataset can contain personal information.
-# Keep audit metadata and data/README.md, never auto-commit raw CV records.
-/data/normalized/

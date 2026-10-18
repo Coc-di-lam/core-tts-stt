@@ -1,140 +1,146 @@
-# CÓC ĐI LÀM — Nền Tảng Phỏng Vấn OJT Thực Chiến: Luyện phỏng vấn chuyên sâu bằng giọng nói kết hợp kiểm toán CV & JD Gap Analysis.
+# Speech Service — STT & TTS tiếng Việt
 
-Ứng dụng gồm **một backend FastAPI** chia theo domain và một frontend Next.js. Các domain hiện chạy trong cùng process; cấu trúc folder chưa phải microservices.
+Service rời chỉ làm hai việc: **lời nói → chữ** và **chữ → lời nói**. Không có LLM hội thoại, không có
+session, không có DB. Core AI (`dpl_pvan`) chỉ xử lý chữ; frontend hoặc gateway gọi service này
+trước và sau core.
 
-## Các model thực sự được dùng
+| Chức năng | Model | Chạy ở đâu |
+|---|---|---|
+| STT streaming | `gemini-3.5-transcribe-live` ([docs](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)) | Google Live API, service làm relay WebSocket (API key không lộ ra client) |
+| STT batch | `gemini-3.5-transcribe` ([docs](https://ai.google.dev/gemini-api/docs/transcribe)) | Google API, audio gửi inline |
+| TTS | VieNeu-TTS v3 Turbo, 48 kHz | Local, tự chọn thiết bị: có GPU NVIDIA → PyTorch/CUDA; không có → ONNX Runtime int8 trên CPU |
 
-| Vai trò | Model/runtime | Chạy ở đâu | Cấu hình |
-|---|---|---|---|
-| Phát hiện bắt đầu/kết thúc nói | Silero VAD ONNX; energy VAD local khi ONNX chưa sẵn sàng | Browser | `frontend/public/models/silero_vad.onnx` |
-| Chuyển lời nói thành chữ | Qwen3-ASR-1.7B | Backend local, CUDA | `STT_MODEL_PATH`, `STT_DEVICE` |
-| Quyết định có nghe tiếp, hỏi lại, đổi độ khó, kết thúc | Laya Multilingual 322M | Backend local, CPU/RAM | `LAYA_MODEL_PATH`, `LAYA_DEVICE`, `LAYA_FAST` |
-| Sinh lời thoại và câu hỏi theo CV/JD/khung | Gemini 3.5 Flash Lite | Google API | `GEMINI_FLASH_MODEL`, `GOOGLE_GEMINI_API_KEY` |
-| Đọc lời phỏng vấn | VieNeu-TTS v3 Turbo | Backend local, mặc định CUDA | `VIENEU_MODEL_ID`, `VIENEU_VOICE`, `VIENEU_DEVICE` |
-| Chấm rubric cuối phiên | Gemini 3.5 Flash Lite | Google API | `GEMINI_FLASH_MODEL` |
-
-Các weight Qwen, VieNeu và Laya được tải/cache trên máy chạy backend. Câu hỏi và rubric gửi văn bản liên quan tới Gemini; âm thanh micro đi tới backend local. Luồng hiện tại không gọi ElevenLabs hay Web Speech Recognition.
-
-## Kiến trúc hệ thống tổng thể (System Architecture)
-
-```mermaid
-flowchart TD
-    subgraph Client["Trình duyệt (Frontend - Next.js 16)"]
-        UI["Giao diện phỏng vấn trực tiếp\n/interview/[sessionId]"]
-        VAD["Silero VAD / Energy VAD\n(Phát hiện giọng nói & ngắt câu)"]
-        AudioRec["Web Audio Recorder\n(Thu âm micro 16kHz)"]
-        Karaoke["Karaoke Subtitles Sync\n(Highlight chữ khớp mili-giây)"]
-        AudioPlayer["HTML Audio Element\n(WSOLA time-stretching 0.92x)"]
-    end
-
-    subgraph BackendGateway["FastAPI Gateway (Port 8000)"]
-        WS["WebSocket Controller\n/ws/interview/{session_id}"]
-        SpeechAPI["Speech Router\n/api/v1/tts & /api/v1/stt"]
-        SessionAPI["Sessions Router\n/api/v1/sessions"]
-    end
-
-    subgraph DecisionEngine["Hệ thống ra quyết định & Hội thoại (Backend Domains)"]
-        Orchestrator["Question Service & Dialogue Orchestrator\n(Chuẩn hóa phong thái Tech Lead)"]
-        Laya["Local Laya System-1 Controller\n(convaiinnovations/laya-multilingual trên CPU)"]
-        Policy["Hard Policy Engine\n(Kiểm soát an toàn turn & ASR gate)"]
-        Evaluator["Rubric Evidence Evaluator\n(STAR, Technical, Case Study, HR Motivation)"]
-        Report["OJT Report Service\n(Tổng hợp 4 trục năng lực OJT)"]
-    end
-
-    subgraph SpeechModels["Hạ tầng AI cục bộ (NVIDIA RTX 4050 GPU 6GB)"]
-        STT["Qwen3-ASR 1.7B (bfloat16)\nNhận diện giọng nói ~700ms"]
-        TTS["VieNeu-TTS v3 Turbo (48kHz)\n+ 150ms Zero-Padding Buffer\n(Giọng Hải Đăng, triệt tiêu nuốt chữ đầu)"]
-    end
-
-    subgraph CloudAI["Cloud Foundation Model"]
-        Gemini["Google Gemini 2.0 Flash\n(Tạo lời thoại tự nhiên & Đánh giá Rubric)"]
-    end
-
-    %% Flow connections
-    AudioRec -->|Stream Audio PCM| VAD
-    VAD -->|Final Audio Buffer| SpeechAPI
-    SpeechAPI -->|WAV 16kHz| STT
-    STT -->|Transcript Tiếng Việt| WS
-
-    WS -->|Transcript đã xác minh| Laya
-    Laya -->|Hành động điều phối\nprobe / same_level / harder| Policy
-    Policy -->|Validated Action| Orchestrator
-
-    Orchestrator -->|Prompt Mock Interview| Gemini
-    Gemini -->|Lời thoại kết nối + Câu hỏi mới| Orchestrator
-    Orchestrator -->|QUESTION_TEXT| WS
-    WS -->|QUESTION_TEXT payload| UI
-
-    UI -->|Yêu cầu tổng hợp giọng nói| SpeechAPI
-    SpeechAPI -->|Văn bản sạch| TTS
-    TTS -->|WAV 48kHz + 150ms buffer & offset| AudioPlayer
-    AudioPlayer --> Karaoke
-
-    SessionAPI -->|Kết thúc phiên| Evaluator
-    Evaluator -->|Chấm điểm rubric| Gemini
-    Evaluator --> Report
+```
+Browser (mic, PCM 16 kHz) ──WS /v1/stt/stream──▶ interim… final ──▶ Browser/Gateway ──candidate_answer──▶ core (WS)
+core ──response_token──▶ Gateway (cắt theo câu) ──▶ POST /v1/tts/stream ──PCM từng đoạn──▶ Browser
 ```
 
-1. Người dùng chọn CV; giao diện lấy chuyên môn và cấp độ từ CV mẫu hoặc hồ sơ CV đã tải lên để lọc các JD đã có khung. CV mẫu không có JD khớp bị ẩn khỏi danh sách. Không còn hai ô chọn chuyên môn/cấp độ riêng. Người dùng vẫn chọn **JD cụ thể** trong danh sách đã lọc, vì yêu cầu tuyển dụng và công ty không nằm trong CV. JD đã chọn quyết định khung phỏng vấn; CV bổ sung bằng chứng cá nhân. CV không có chuyên môn/cấp độ rõ hoặc không có JD khớp sẽ không được tự ghép JD khác ngành/cấp độ.
-2. `candidate` chuẩn hóa CV/JD; `interview` nhận blueprint chứa kỹ năng, giai đoạn và tiêu chí rubric của khung. Gemini **viết câu mới** theo blueprint và lịch sử, không chép nguyên câu mẫu trong khung.
-3. Khi vào phòng, browser tự xin quyền micro. Nếu Silero còn tải, energy VAD local vẫn tự phát hiện lời nói và chốt sau nhịp im lặng; không bắt ứng viên bấm tay. Browser gửi cửa sổ WAV tối đa 4,5 giây để có partial transcript; lượt partial đầu bắt đầu sau khoảng 1,5 giây giọng nói. Khi chốt, WAV được cắt bớt khoảng im lặng thừa rồi gửi tới Qwen3-ASR trên backend; file tạm được xóa sau nhận dạng.
-4. Partial transcript qua WebSocket cho Laya xem để quyết định nghe tiếp, chờ ứng viên, ngắt mềm hoặc hỏi lại. Hard Policy kiểm tra action hợp lệ. Nếu final transcript chưa rõ, orchestrator nhờ Gemini viết **một câu hỏi lại có ngữ cảnh**, VieNeu đọc câu đó và micro tự mở lại. Hai lần nhận dạng độc lập khớp nhau mới tự chốt câu trả lời; không có nút xác nhận transcript bắt buộc.
-5. Sau câu đã xác nhận, Laya chọn hướng câu tiếp theo; Gemini tạo lời hỏi từ CV/JD/khung/câu vừa nói. VieNeu tạo WAV; browser bắt đầu hiện lời theo tiến độ audio. **VieNeu chưa có timestamp phoneme**, nên mốc chữ hiện là ước lượng tuyến tính, chưa phải forced alignment chính xác.
-6. Rubric chỉ chạy khi buổi phỏng vấn kết thúc. Nếu Gemini lỗi, report ở trạng thái chờ đánh giá; không dùng điểm tạm làm điểm thật.
-
-## Cấu trúc chính
-
-```text
-backend/app/main.py                  Một FastAPI, ghép router/lifecycle
-backend/app/domains/candidate/       Đọc CV/JD và tạo ngữ cảnh ứng viên
-backend/app/domains/interview/       Blueprint, khung, Laya, WebSocket, Gemini, rubric
-backend/app/domains/speech/api.py    VieNeu TTS và Qwen3-ASR local
-backend/app/shared/                 Settings, contracts, storage, log/trace
-frontend/src/app/interview/         Chọn CV/JD và phòng phỏng vấn
-frontend/src/lib/edgeRuntime.ts     Thu WAV, gọi STT/TTS và phát audio
-frontend/src/workers/vad.worker.ts  Silero VAD trong browser
-data/normalized/                    candidates_clean.json, jobs_below_mid_clean.json,
-                                    interview_frameworks_clean.json
-docs/                               Tài liệu kiến trúc, JSON schemas, báo cáo benchmark
-tools/                              Công cụ benchmark, kiểm tra thủ công và admin
-```
-
-Ranh giới domain và quy tắc import ở [backend/app/domains/README.md](backend/app/domains/README.md). Debug luồng local tại `http://127.0.0.1:3000/debug`; backend health ở `http://127.0.0.1:8000/health`.
-
-## Cấu hình giọng và hiệu năng
-
-Sao chép `backend/.env.example` thành `backend/.env`, rồi chỉnh các biến:
-
-```dotenv
-TTS_PROVIDER=vieneu
-VIENEU_MODEL_ID=vieneu-v3-turbo
-VIENEU_VOICE=Hải Đăng
-VIENEU_DEVICE=cuda
-VIENEU_MAX_BATCH_SIZE=32
-VIENEU_MAX_STREAMS=16
-VIENEU_TEMPERATURE=0.8
-VIENEU_TOP_K=25
-VIENEU_TOP_P=0.95
-STT_MODEL_ID=Qwen3-ASR-1.7B
-STT_MODEL_PATH=Qwen/Qwen3-ASR-1.7B
-STT_DEVICE=cuda
-LAYA_MODEL_PATH=convaiinnovations/laya-multilingual
-LAYA_DEVICE=cpu
-LAYA_FAST=false
-GEMINI_FLASH_MODEL=gemini-3.5-flash-lite
-```
-
-`VIENEU_VOICE` là tên preset, ví dụ `Hải Đăng`, `Mai Anh`, `Trúc Ly`. Backend trả danh sách tại `/api/v1/tts/voices`. Mặc định chỉ Qwen3-ASR và VieNeu được nạp lên CUDA/VRAM; Laya dùng CPU/RAM (`LAYA_DEVICE=cpu`, `LAYA_FAST=false`). Nếu máy không có CUDA, cần chủ động đổi `STT_DEVICE` và `VIENEU_DEVICE` sang `cpu` trước khi chạy. `/health` trả thiết bị thực tế của các model.
-
-## Chạy và kiểm thử
-
-Trên Windows, chạy `start.bat`; `stop.bat` dừng launcher. Có thể dùng `python dev_runner.py status` để kiểm tra trạng thái. Frontend mặc định `http://127.0.0.1:3000`, backend `http://127.0.0.1:8000`.
+## Chạy local
 
 ```powershell
-python -m pytest backend/tests -q
-cd frontend
-npm test
-npm run build
+copy .env.example .env      # điền GEMINI_API_KEY
+uv sync
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8010
 ```
 
-Kiểm tra model local bằng `python tools/preflight_local_models.py`. Benchmark đầy đủ hai phiên 8 lượt với **Gemini API thật** chạy bằng `python tools/benchmarks/benchmark_interview_local_two_runs.py --live --runs 2`; script sinh lời ứng viên bằng VieNeu, cho Qwen nghe WAV, gửi transcript qua WebSocket, để Gemini/Laya điều phối và chấm cuối phiên. Kịch bản này kiểm tra backend/audio API; thử micro, Silero và phát audio trong browser cần chạy UI tương tác riêng.
+Mở `http://127.0.0.1:8010/` để dùng trang test: bấm nói → STT live (hiện chữ tạm trong lúc nói) → TTS →
+phát lại, kèm thời gian từng bước; tùy chọn tự dừng khi Gemini thấy hết nói. Có form riêng cho
+`/v1/stt` (upload file) và `/v1/tts`. Lần chạy đầu tải weight VieNeu
+từ Hugging Face; `/health` báo `tts.state` = `loading` cho tới khi sẵn sàng.
+
+Docker: `docker compose up --build` (cổng `127.0.0.1:8010`, weight cache trong volume `models`). Image
+mặc định là bản CPU (không có torch). Muốn dùng GPU trong container thì cần image có `--extra cuda`, CUDA
+runtime và `gpus: all`; image hiện tại chưa làm phần này.
+
+Trên Windows không có GPU, nên chạy TTS trực tiếp (`uv run …`) thay vì Docker Desktop: đo trên cùng máy,
+trong container (VM WSL2, 8 vCPU dùng chung với các container khác) TTS chậm hơn ~3–4 lần (âm đầu
+~0,6–0,8 s, RTF ~1,4). Trên server Linux chạy Docker trực tiếp thì không bị khoản chậm này.
+
+## API
+
+`/health` và `/` luôn mở. Khi đặt `SERVICE_TOKEN`, mọi `/v1/*` cần `Authorization: Bearer <token>`.
+
+### `WS /v1/stt/stream` — STT streaming (khuyên dùng cho hội thoại)
+
+Client gửi:
+
+| Tin nhắn | Mô tả |
+|---|---|
+| `{"type": "start", "language"?, "mode"?, "vocabulary"?, "token"?}` | Bắt buộc, tin đầu tiên. Ý nghĩa field như `/v1/stt`; `token` khi có `SERVICE_TOKEN` (WebSocket trình duyệt không gửi được header) |
+| frame nhị phân | PCM 16-bit little-endian, 16 kHz, mono; nên ~100 ms (3200 byte) mỗi frame, tối đa 64 KB |
+| `{"type": "end"}` | Người nói xong lượt này → service trả đúng một `final` |
+| `{"type": "stop"}` | Đóng phiên (hoặc đóng socket) |
+
+Service gửi: `ready` (`setup_ms`), `interim` (`text` = toàn bộ chữ của lượt hiện tại, cập nhật liên tục),
+`vad` (`event`: `start`/`end`, VAD phía Gemini), `final` (`text`, `latency_ms` tính từ lúc nhận `end`),
+`error` (`detail`).
+
+- Một phiên chạy được nhiều lượt; Gemini giới hạn phiên live ~10 phút, hết thì mở phiên mới.
+- Gemini tự cắt câu khi người nói ngừng giữa chừng; service gộp các đoạn lại tới khi nhận `end`.
+- Lượt chỉ có im lặng trả `final` với `text` rỗng ngay lập tức. Nếu Gemini không trả đoạn cuối trong
+  `STT_LIVE_FINAL_TIMEOUT_SEC`, service chốt bằng phần chữ đang có.
+- Muốn rảnh tay: chờ `vad` `end` rồi gửi `end` (trang test có tùy chọn này).
+
+### `POST /v1/stt` — STT batch, multipart
+
+| Field | Bắt buộc | Mô tả |
+|---|---|---|
+| `file` | có | WAV, MP3, OGG, FLAC, M4A, AAC, AIFF, Opus, WebM (MediaRecorder của trình duyệt). Tối đa 15 MB |
+| `language` | không | BCP-47, phân tách bằng dấu phẩy (`vi-VN,en-US`); `auto` để tự nhận diện. Mặc định `STT_LANGUAGE_CODES` |
+| `mode` | không | `smart` (bỏ ậm ừ, tự định dạng) hoặc `verbatim`. Mặc định `STT_MODE` |
+| `vocabulary` | không | Thuật ngữ cần nhận đúng, phân tách bằng dấu phẩy (`Kubernetes,FastAPI`) |
+
+```json
+{"text": "Em đã triển khai hệ thống bằng FastAPI và Redis.", "model": "gemini-3.5-transcribe",
+ "language_codes": ["vi-VN"], "mode": "smart", "latency_ms": 3684.3}
+```
+
+### `POST /v1/tts` — JSON `{"text": "...", "voice": "Mai Anh"}`
+
+Trả `audio/wav` (48 kHz, PCM 16-bit, có 150 ms im lặng đầu và 80 ms cuối để loa không nuốt âm đầu).
+Header: `X-Audio-Duration` (giây, không tính phần đệm), `X-Latency-Ms`, `X-Voice` (URL-encoded),
+`X-Cache-Hit`. Tối đa `TTS_MAX_CHARS` ký tự; nên gửi từng câu để giảm độ trễ.
+
+### `POST /v1/tts/stream` — JSON như `/v1/tts` (khuyên dùng cho hội thoại)
+
+Trả PCM thô `audio/pcm` (s16le, mono) theo từng đoạn ngay khi VieNeu sinh ra; header `X-Sample-Rate`
+(48000 với Turbo, 24000 với Nano), `X-Channels`, `X-Sample-Format`, `X-Voice`. Có cùng phần đệm im lặng
+như `/v1/tts`. Lỗi kiểm tra đầu vào (400/413/422/503) trả về trước khi stream bắt đầu. Câu đã sinh được
+cache, lần sau trả ngay. Client phát bằng Web Audio, xếp lịch từng đoạn nối tiếp nhau (xem `ttsStream`
+trong `app/static/index.html`).
+
+### `GET /v1/tts/voices`
+
+Danh sách giọng preset của VieNeu (`id` dùng cho trường `voice`).
+
+### Mã lỗi
+
+`400` audio/văn bản rỗng · `401` sai token · `413` vượt giới hạn · `415` định dạng audio không hỗ trợ ·
+`422` giọng/mode không hợp lệ · `502`/`504` Gemini lỗi hoặc quá thời gian · `503` thiếu
+`GEMINI_API_KEY` hoặc VieNeu không tải được.
+
+## TTS trên CPU và GPU
+
+`TTS_DEVICE=auto` (mặc định): nếu cài PyTorch có CUDA (`uv sync --extra cuda`) và thấy GPU NVIDIA thì
+chạy như trước (PyTorch, batching, stream scheduler cho nhiều luồng cùng lúc); nếu không thì chạy ONNX
+Runtime trên CPU với các tối ưu:
+
+- **int8** (`TTS_CPU_PRECISION`): nhanh hơn fp32 ~1,5 lần, chất lượng như nhau. Cần CPU có VNNI
+  (Intel Ice Lake/Alder Lake trở lên, AMD Zen 4 trở lên); CPU cũ nghe méo thì đổi sang `fp32`.
+- **Streaming** (`/v1/tts/stream`): âm thanh đầu tiên sẵn sau ~0,2–0,35 s thay vì chờ cả câu.
+- **Warm-up** sau khi tải model, nên request đầu không chậm hơn các request sau.
+- **Cache** các câu đã sinh (128 câu).
+- CPU yếu: `TTS_MODEL=vieneu-v3-nano` sinh cả câu nhanh hơn (RTF 0,19) nhưng âm đầu tới muộn
+  (~0,9 s, không stream thật), 24 kHz, bộ giọng riêng.
+
+Đo trên Ryzen 7 8845HS (8 nhân, không GPU), 3 câu phỏng vấn ~12–14 s audio. WER là tỉ lệ sai từ khi cho
+Gemini transcribe lại audio:
+
+| Cấu hình | Thời gian / độ dài audio (RTF) | Âm đầu tiên (stream) | WER |
+|---|---|---|---|
+| Turbo fp32 | 0,53 | ~420 ms | 1,8% |
+| **Turbo int8 (mặc định)** | **0,34** | **~180–190 ms** | 1,8% |
+| Turbo int8, 4 luồng | 0,34 | ~185 ms | 1,8% |
+| Nano | 0,19 | ~900 ms | 1,8% |
+
+## Hiệu năng đo được (CPU, không GPU)
+
+- TTS: tải model + warm-up ~10 s (lần đầu lâu hơn do tải weight); stream qua HTTP: âm đầu ~250–360 ms,
+  cả câu 4–6 s audio xong trong ~1,6–2,8 s.
+- STT live: mở phiên ~0,5–0,6 s; `final` về **~250–300 ms** sau `end` (hoặc gần như ngay khi chờ `vad` `end`).
+- STT batch: ~3,7–4,5 s mỗi lượt cho câu ~4 s audio, phần lớn là thời gian gọi Gemini.
+- Vòng đầy đủ trên trang test (dừng nói → nghe tiếng TTS): **~0,24 s** với TTS streaming (~1,7 s nếu chờ cả WAV).
+
+## Kiểm thử
+
+```powershell
+uv run pytest
+```
+
+Test dùng Gemini giả (`httpx.MockTransport`, Live API giả) và VieNeu giả, không cần mạng hay weight.
+
+## Cấu hình
+
+Xem `.env.example`. Các biến chính: `GEMINI_API_KEY`, `STT_LIVE_MODEL`, `STT_LIVE_FINAL_TIMEOUT_SEC`, `STT_MODEL`, `STT_LANGUAGE_CODES`, `STT_MODE`,
+`TTS_MODEL`, `TTS_VOICE`, `TTS_DEVICE` (`auto` | `cpu` | `cuda`), `TTS_CPU_PRECISION`, `TTS_CPU_THREADS`, `TTS_PRELOAD`,
+`SERVICE_TOKEN`, `CORS_ORIGINS`.

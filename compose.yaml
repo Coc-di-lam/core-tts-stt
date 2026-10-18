@@ -1,0 +1,12 @@
+services:
+  speech:
+    build: .
+    ports:
+      - "127.0.0.1:8010:8000"
+    env_file: .env
+    volumes:
+      - models:/models  # Hugging Face cache for VieNeu weights
+    restart: unless-stopped
+
+volumes:
+  models:
