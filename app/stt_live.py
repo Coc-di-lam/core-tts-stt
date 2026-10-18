@@ -1,7 +1,7 @@
 """Streaming speech-to-text: relay a client WebSocket to the Gemini Live transcription model.
 
 Client protocol (`WS /v1/stt/stream`):
-  -> {"type": "start", "language"?, "mode"?, "vocabulary"?, "token"?}   first message, required
+  -> {"type": "start", "language"?, "mode"?, "vocabulary"?, "fluency"?, "token"?}   first message, required
   -> binary frames: raw PCM 16-bit little-endian, 16 kHz, mono (~100 ms per frame)
   -> {"type": "end"}    the speaker finished this turn; the service answers with one "final"
   -> {"type": "stop"}   close the session (or just close the socket)
@@ -9,6 +9,8 @@ Client protocol (`WS /v1/stt/stream`):
   <- {"type": "interim", "text"}   running text of the current turn, revised while speaking
   <- {"type": "vad", "event": "start" | "end"}   Gemini server-side voice activity
   <- {"type": "final", "text", "latency_ms"}   whole turn; latency counts from "end"
+     with "fluency": true also "verbatim" (raw, with fillers) and "fluency" (app/fluency.py metrics);
+     Gemini then runs in verbatim mode and "text" is the verbatim transcript without fillers
   <- {"type": "error", "detail"}
 One session can carry several turns; Gemini caps a live session at ~10 minutes.
 """
@@ -25,12 +27,14 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from app import fluency
 from app.config import Settings, split_csv
 
 logger = logging.getLogger(__name__)
 
 PCM_MIME_TYPE = "audio/pcm;rate=16000"
 MAX_FRAME_BYTES = 64 * 1024
+MAX_TURN_PCM_BYTES = 16_000 * 2 * 600  # keep up to 10 min of a turn for fluency analysis
 
 
 class Upstream(Protocol):
@@ -81,6 +85,7 @@ class _Turn:
         self.interim = ""
         self.speaking = False
         self.ended_at: float | None = None
+        self.pcm = bytearray()
 
     def text(self) -> str:
         return " ".join(part for part in [*self.segments, self.interim] if part).strip()
@@ -112,6 +117,9 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
     if mode not in {"smart", "verbatim"}:
         await _close(client, 1008, "mode phải là 'smart' hoặc 'verbatim'.")
         return
+    measure = bool(start.get("fluency"))
+    if measure:
+        mode = "verbatim"  # smart mode drops the fillers and repetitions being measured
 
     started = time.perf_counter()
     try:
@@ -121,7 +129,7 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
         await _close(client, 1011, f"Không mở được Gemini Live: {type(exc).__name__}: {str(exc)[:200]}")
         return
     await client.send_json({"type": "ready", "model": settings.stt_live_model,
-                            "language_codes": languages, "mode": mode,
+                            "language_codes": languages, "mode": mode, "fluency": measure,
                             "setup_ms": round((time.perf_counter() - started) * 1000, 1)})
 
     turn = _Turn()
@@ -133,8 +141,12 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
         async with lock:
             if turn.ended_at is None:
                 return
-            latency = round((time.perf_counter() - turn.ended_at) * 1000, 1)
-            await client.send_json({"type": "final", "text": turn.text(), "latency_ms": latency})
+            message = {"type": "final", "text": turn.text()}
+            if measure:
+                clean, metrics = fluency.analyze(bytes(turn.pcm), message["text"])
+                message.update(text=clean, verbatim=turn.text(), fluency=metrics)
+            message["latency_ms"] = round((time.perf_counter() - turn.ended_at) * 1000, 1)
+            await client.send_json(message)
             turn.reset()
         if timer is not None and timer is not asyncio.current_task():
             timer.cancel()
@@ -156,6 +168,8 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
                     await client.send_json({"type": "error", "detail": "Frame audio phải là PCM16 và ≤ 64 KB."})
                     continue
                 if turn.ended_at is None and frame:
+                    if measure and len(turn.pcm) < MAX_TURN_PCM_BYTES:
+                        turn.pcm.extend(frame)
                     await upstream.send(json.dumps({"realtimeInput": {"audio": {
                         "data": base64.b64encode(frame).decode("ascii"), "mimeType": PCM_MIME_TYPE}}}))
                 continue

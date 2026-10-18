@@ -46,7 +46,7 @@ Client gửi:
 
 | Tin nhắn | Mô tả |
 |---|---|
-| `{"type": "start", "language"?, "mode"?, "vocabulary"?, "token"?}` | Bắt buộc, tin đầu tiên. Ý nghĩa field như `/v1/stt`; `token` khi có `SERVICE_TOKEN` (WebSocket trình duyệt không gửi được header) |
+| `{"type": "start", "language"?, "mode"?, "vocabulary"?, "fluency"?, "token"?}` | Bắt buộc, tin đầu tiên. Ý nghĩa field như `/v1/stt`; `fluency: true` để đo độ ấp úng (xem dưới); `token` khi có `SERVICE_TOKEN` (WebSocket trình duyệt không gửi được header) |
 | frame nhị phân | PCM 16-bit little-endian, 16 kHz, mono; nên ~100 ms (3200 byte) mỗi frame, tối đa 64 KB |
 | `{"type": "end"}` | Người nói xong lượt này → service trả đúng một `final` |
 | `{"type": "stop"}` | Đóng phiên (hoặc đóng socket) |
@@ -60,6 +60,22 @@ Service gửi: `ready` (`setup_ms`), `interim` (`text` = toàn bộ chữ của 
 - Lượt chỉ có im lặng trả `final` với `text` rỗng ngay lập tức. Nếu Gemini không trả đoạn cuối trong
   `STT_LIVE_FINAL_TIMEOUT_SEC`, service chốt bằng phần chữ đang có.
 - Muốn rảnh tay: chờ `vad` `end` rồi gửi `end` (trang test có tùy chọn này).
+
+**Đo độ ấp úng (`fluency: true`).** Gemini chạy ở chế độ verbatim (giữ "ừm", "ờ", lặp từ) và service giữ
+PCM của lượt. `final` khi đó có thêm `verbatim` (nguyên văn), `fluency` (số liệu), còn `text` là bản đã bỏ
+từ đệm. Số liệu tính ngay khi chốt lượt (không gọi API thêm, không thêm độ trễ), trong `app/fluency.py`:
+
+| Field | Ý nghĩa |
+|---|---|
+| `speech_duration_ms`, `total_silence_ms`, `pause_count`, `words_per_minute` | Cùng tên với `vad_metrics` của core, chuyển thẳng được |
+| `long_pause_count`, `longest_pause_ms` | Ngắt ≥ 1 s; ngắt dài nhất |
+| `leading_silence_ms` | Im lặng từ lúc bắt đầu thu tới khi nói |
+| `filler_count`, `fillers`, `fillers_per_100_words` | Từ đệm (ừm, ờ, ơ, um, uh…; "à"/"ừ" chỉ khi đứng riêng) |
+| `repetition_count` | Lặp cụm từ liền nhau ("em là em là"), không tính từ láy ("từ từ") |
+| `hesitation_level` | `low` / `medium` / `high`, gộp từ đệm, ngắt dài và lặp từ |
+
+Đây là heuristic mô tả cách nói, không phải đánh giá năng lực. Ngắt quãng đo bằng năng lượng tín hiệu
+nên tiếng ồn nền lớn làm số liệu kém chính xác.
 
 ### `POST /v1/stt` — STT batch, multipart
 
