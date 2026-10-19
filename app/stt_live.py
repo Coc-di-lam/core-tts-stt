@@ -107,6 +107,24 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
     if settings.service_token and not hmac.compare_digest(str(start.get("token") or ""), settings.service_token):
         await _close(client, 1008, "Thiếu hoặc sai service token.")
         return
+
+    backend = settings.stt_backend.strip().lower()
+    if connector == connect_gemini_live and backend in ("gipformer", "auto"):
+        try:
+            from app.stt_gipformer import GipformerTranscriber
+            gip = GipformerTranscriber(settings)
+            if gip.is_available():
+                await relay_stream_gipformer(client, settings, start, gip)
+                return
+            if backend == "gipformer":
+                await _close(client, 1011, "Gipformer STT chưa sẵn sàng hoặc chưa nạp xong.")
+                return
+        except Exception as exc:
+            if backend == "gipformer":
+                await _close(client, 1011, f"Gipformer không khả dụng: {exc}")
+                return
+            logger.warning("Gipformer live stream failed to init (%s), falling back to Gemini Live", exc)
+
     if not settings.gemini_api_key:
         await _close(client, 1011, "Chưa cấu hình GEMINI_API_KEY.")
         return
@@ -238,3 +256,91 @@ async def _close(client: WebSocket, code: int, detail: str) -> None:
     with contextlib.suppress(Exception):
         await client.send_json({"type": "error", "detail": detail})
         await client.close(code=code)
+
+
+async def relay_stream_gipformer(client: WebSocket, settings: Settings, start: dict, gipformer: Any) -> None:
+    """Live streaming transcription relay using local Gipformer ASR."""
+    languages = ["vi-VN"]
+    mode = str(start.get("mode") or settings.stt_mode).strip().lower()
+    measure = bool(start.get("fluency"))
+    started = time.perf_counter()
+
+    await client.send_json({
+        "type": "ready",
+        "model": gipformer.model_name,
+        "language_codes": languages,
+        "mode": mode,
+        "fluency": measure,
+        "setup_ms": round((time.perf_counter() - started) * 1000, 1),
+    })
+
+    pcm_buffer = bytearray()
+    last_interim_len = 0
+    interim_lock = asyncio.Lock()
+
+    async def update_interim() -> None:
+        nonlocal last_interim_len
+        async with interim_lock:
+            current_len = len(pcm_buffer)
+            # Only update if we have at least 0.5s of audio and 0.4s new audio
+            if current_len < 16000 or current_len - last_interim_len < 12800:
+                return
+            last_interim_len = current_len
+            buf = bytes(pcm_buffer)
+        try:
+            partial_text = await asyncio.to_thread(gipformer.transcribe_pcm, buf)
+            if partial_text:
+                await client.send_json({"type": "interim", "text": partial_text})
+        except Exception:
+            pass
+
+    interim_task: asyncio.Task | None = None
+
+    try:
+        while True:
+            message = await client.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            if message.get("bytes") is not None:
+                frame = message["bytes"]
+                if len(frame) > MAX_FRAME_BYTES or len(frame) % 2:
+                    await client.send_json({"type": "error", "detail": "Frame audio phải là PCM16 và ≤ 64 KB."})
+                    continue
+                pcm_buffer.extend(frame)
+                if interim_task is None or interim_task.done():
+                    interim_task = asyncio.create_task(update_interim())
+                continue
+
+            try:
+                command = json.loads(message.get("text") or "{}").get("type")
+            except (ValueError, AttributeError):
+                command = None
+
+            if command == "stop":
+                return
+            if command == "end":
+                ended_at = time.perf_counter()
+                if interim_task and not interim_task.done():
+                    interim_task.cancel()
+                buf = bytes(pcm_buffer)
+                pcm_buffer.clear()
+                last_interim_len = 0
+                if not buf:
+                    await client.send_json({"type": "final", "text": "", "latency_ms": 0.0})
+                    continue
+
+                verbatim = await asyncio.to_thread(gipformer.transcribe_pcm, buf)
+                result = {"type": "final", "text": verbatim}
+                if measure:
+                    clean, metrics = fluency.analyze(buf, verbatim)
+                    result.update(text=clean, verbatim=verbatim, fluency=metrics)
+                result["latency_ms"] = round((time.perf_counter() - ended_at) * 1000, 1)
+                await client.send_json(result)
+            elif command not in {"end"}:
+                await client.send_json({"type": "error", "detail": f"Lệnh không hợp lệ: {command!r}"})
+    finally:
+        if interim_task and not interim_task.done():
+            interim_task.cancel()
+        with contextlib.suppress(Exception):
+            await client.close()
+

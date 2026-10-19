@@ -12,6 +12,18 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ROOT_DIR / ".env", env_file_encoding="utf-8", extra="ignore")
 
+    # STT backend: "auto" = Gipformer local (if available), fallback to Gemini | "gipformer" | "gemini"
+    stt_backend: str = "auto"
+
+    # STT: local Gipformer (g-group-ai-lab/gipformer1.5-68M-rnnt, Zipformer RNN-T)
+    gipformer_version: str = "1.5"  # "1.5" (latest 68M) | "1"
+    gipformer_quantize: str = "fp32"  # "fp32" (max setting, full precision) | "int8"
+    gipformer_decoding_method: str = "modified_beam_search"  # "modified_beam_search" (max setting) | "greedy_search"
+    gipformer_model_dir: str = ""  # empty = HuggingFace cache
+    gipformer_num_threads: int = 4
+    gipformer_preload: bool = True
+    stt_fallback_gemini: bool = True  # Automatically fallback to Gemini STT if Gipformer is unavailable/fails
+
     # STT (batch): Gemini transcription API
     gemini_api_key: str = ""
     gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -30,12 +42,13 @@ class Settings(BaseSettings):
 
     # TTS backend: "auto" = VieNeu on an NVIDIA GPU (max settings), else Gemini TTS | "vieneu" | "gemini"
     tts_backend: str = "auto"
+    tts_fallback_gemini: bool = True  # Automatically fallback to Gemini TTS if VieNeu fails
 
     # TTS: local VieNeu (ONNX Runtime on CPU, PyTorch on CUDA)
     tts_model: str = "vieneu-v3-turbo"  # or "vieneu-v3-nano" for weak CPUs (24 kHz, own voice list)
     tts_voice: str = "Trúc Ly"  # young female, natural Northern style (also in vieneu-v3-nano)
     tts_device: str = "auto"  # auto = cuda when PyTorch sees a GPU, else cpu
-    tts_cpu_precision: str = "int8"  # "int8" (~1.5x faster, needs a VNNI CPU) | "fp32"
+    tts_cpu_precision: str = "fp32"  # "fp32" (best quality) | "int8" (~1.5x faster, needs a VNNI CPU)
     tts_cpu_threads: int = 0  # 0 = engine default (~physical cores, max 8)
     tts_gpu_max_batch_size: int = 32
     tts_gpu_max_streams: int = 16
@@ -45,6 +58,8 @@ class Settings(BaseSettings):
     tts_temperature: float = 0.8
     tts_top_k: int = 25
     tts_top_p: float = 0.95
+    tts_repetition_penalty: float = 1.2
+    tts_apply_watermark: bool = False  # False = purest uncompressed audio without acoustic watermark
 
     # TTS: Gemini (cloud), same GEMINI_API_KEY and Interactions endpoint as STT
     gemini_tts_model: str = "gemini-3.8-flash-lite-tts"

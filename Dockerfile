@@ -8,7 +8,7 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv \
 
 WORKDIR /srv
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project
+RUN uv sync --locked --no-dev --no-install-project --extra cuda
 COPY app ./app
 
 EXPOSE 8000

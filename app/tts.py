@@ -127,7 +127,7 @@ class _CachedSynthesizer:
 class VieneuSynthesizer(_CachedSynthesizer):
     provider = "vieneu"
 
-    def __init__(self, settings: Settings, model: Any = None):
+    def __init__(self, settings: Settings, model: Any = None, fallback: GeminiSynthesizer | None = None):
         super().__init__(settings)
         self.model_name = settings.tts_model
         self._model = model
@@ -138,6 +138,10 @@ class VieneuSynthesizer(_CachedSynthesizer):
         self.device = resolve_device(settings.tts_device) if model is None else "cpu"
         self.backend = getattr(model, "backend", None)
         self.default_voice = settings.tts_voice
+        self._fallback = fallback
+        is_auto = settings.tts_backend.strip().lower() == "auto"
+        if self._fallback is None and is_auto and settings.tts_fallback_gemini and settings.gemini_api_key:
+            self._fallback = GeminiSynthesizer(settings)
 
     # ---- model ----
     def load(self) -> Any:
@@ -160,6 +164,9 @@ class VieneuSynthesizer(_CachedSynthesizer):
                     self._model = None
                     self.state, self.error = "error", f"{type(exc).__name__}: {exc}"
                     logger.exception("Loading VieNeu failed")
+                    if self.settings.tts_fallback_gemini and self._fallback:
+                        logger.warning("VieNeu TTS không khả dụng (%s), tự động kích hoạt dự phòng Gemini TTS", exc)
+                        return None
                     raise TtsError(503, f"VieNeu TTS không khả dụng: {type(exc).__name__}") from exc
                 self.state, self.error = "ready", None
                 logger.info("VieNeu %s ready on %s/%s in %.1fs", mode, self.device, self.backend,
@@ -188,42 +195,76 @@ class VieneuSynthesizer(_CachedSynthesizer):
         return voices[0]
 
     def voices(self) -> list[dict[str, str]]:
-        return [{"id": voice_id, "label": label.lstrip("⭐ ").strip()}
-                for label, voice_id in self.load().list_preset_voices()]
+        if self.state != "error":
+            try:
+                m = self.load()
+                if m is not None:
+                    return [{"id": voice_id, "label": label.lstrip("⭐ ").strip()}
+                            for label, voice_id in m.list_preset_voices()]
+            except Exception:
+                pass
+        if self._fallback:
+            return self._fallback.voices()
+        return []
 
     @property
     def sample_rate(self) -> int:
-        return int(getattr(self.load(), "sample_rate", 48_000))
+        if self.state == "error" and self._fallback:
+            return self._fallback.sample_rate
+        try:
+            m = self.load()
+            return int(getattr(m, "sample_rate", 48_000)) if m is not None else 48_000
+        except Exception:
+            if self._fallback:
+                return self._fallback.sample_rate
+            return 48_000
 
-    def _sampling(self) -> dict[str, float]:
-        return {"temperature": self.settings.tts_temperature, "top_k": self.settings.tts_top_k,
-                "top_p": self.settings.tts_top_p}
+    def _sampling(self) -> dict[str, Any]:
+        return {
+            "temperature": self.settings.tts_temperature,
+            "top_k": self.settings.tts_top_k,
+            "top_p": self.settings.tts_top_p,
+            "repetition_penalty": self.settings.tts_repetition_penalty,
+            "apply_watermark": self.settings.tts_apply_watermark,
+        }
 
     # ---- whole clip ----
     def synthesize(self, text: str, voice: str | None = None) -> Speech:
-        text, voice, key = self._prepare(text, voice)
+        text_prep, voice_prep, key = self._prepare(text, voice)
         started = time.perf_counter()
         cached = self._cache_get(key)
         if cached is not None:
-            return Speech(cached, _wav_duration(cached), voice, 0.0, True)
+            return Speech(cached, _wav_duration(cached), voice_prep, 0.0, True)
 
-        model = self.load()
+        if self.state == "error" and self.settings.tts_fallback_gemini and self._fallback:
+            return self._fallback.synthesize(text, voice)
+
         try:
+            model = self.load()
+            if model is None and self.settings.tts_fallback_gemini and self._fallback:
+                return self._fallback.synthesize(text, voice)
+            preset_voices = {voice_id for _, voice_id in model.list_preset_voices()} if model is not None else set()
+            if preset_voices and voice_prep not in preset_voices:
+                raise TtsError(422, f"Voice '{voice_prep}' not found.")
             with self._infer_lock:
-                waveform = model.infer(text, voice=voice, **self._sampling())
-        except ValueError as exc:  # unknown preset voice
-            raise TtsError(422, str(exc)[:300]) from exc
+                waveform = model.infer(text_prep, voice=voice_prep, **self._sampling())
+            waveform = _as_float32(waveform)
+            if waveform.size == 0:
+                raise TtsError(503, "VieNeu trả audio rỗng.")
+            wav = _encode_wav(waveform, self.sample_rate)
+            self._cache_put(key, wav)
+            return Speech(wav, round(waveform.size / self.sample_rate, 3), voice_prep,
+                          round((time.perf_counter() - started) * 1000, 1), False)
         except Exception as exc:
+            if isinstance(exc, TtsError) and exc.status_code < 500:
+                raise
+            if self.settings.tts_fallback_gemini and self._fallback:
+                logger.warning("VieNeu synthesize thất bại (%s), tự động chuyển sang Gemini TTS", exc)
+                return self._fallback.synthesize(text, voice)
+            if isinstance(exc, TtsError):
+                raise
             logger.exception("VieNeu synthesis failed")
             raise TtsError(503, f"VieNeu TTS lỗi: {type(exc).__name__}") from exc
-
-        waveform = _as_float32(waveform)
-        if waveform.size == 0:
-            raise TtsError(503, "VieNeu trả audio rỗng.")
-        wav = _encode_wav(waveform, self.sample_rate)
-        self._cache_put(key, wav)
-        return Speech(wav, round(waveform.size / self.sample_rate, 3), voice,
-                      round((time.perf_counter() - started) * 1000, 1), False)
 
     # ---- streaming ----
     def stream(self, text: str, voice: str | None = None, cancel: threading.Event | None = None) -> Iterator[bytes]:
@@ -234,34 +275,54 @@ class VieneuSynthesizer(_CachedSynthesizer):
         """
         import numpy as np
 
-        text, voice, key = self._prepare(text, voice)
-        model = self.load()
-        rate = self.sample_rate
+        text_prep, voice_prep, key = self._prepare(text, voice)
         cached = self._cache_get(key)
         if cached is not None:
             yield _wav_pcm(cached)
             return
-        if voice not in {voice_id for _, voice_id in model.list_preset_voices()}:
-            raise TtsError(422, f"Voice '{voice}' not found.")
 
-        # ONNX/CPU runs one generation at a time; the CUDA stream scheduler serves concurrent streams.
-        lock = self._infer_lock if self.backend != "pytorch" else _NullLock()
-        parts: list[np.ndarray] = []
-        with lock:
-            yield _to_pcm16(np.zeros(int(rate * LEADING_PAD_SEC), dtype=np.float32))
-            try:
-                for chunk in model.infer_stream(text, voice=voice, **self._sampling()):
-                    if cancel is not None and cancel.is_set():
-                        return
-                    chunk = _as_float32(chunk)
-                    parts.append(chunk)
-                    yield _to_pcm16(chunk)
-            except Exception:
-                logger.exception("VieNeu streaming failed")
+        if self.state == "error" and self.settings.tts_fallback_gemini and self._fallback:
+            logger.warning("VieNeu ở trạng thái lỗi, stream tự động chuyển sang Gemini TTS")
+            yield from self._fallback.stream(text, voice, cancel)
+            return
+
+        try:
+            model = self.load()
+            if model is None and self.settings.tts_fallback_gemini and self._fallback:
+                yield from self._fallback.stream(text, voice, cancel)
+                return
+            preset_voices = {voice_id for _, voice_id in model.list_preset_voices()} if model is not None else set()
+            if preset_voices and voice_prep not in preset_voices:
+                raise TtsError(422, f"Voice '{voice_prep}' not found.")
+
+            rate = self.sample_rate
+            lock = self._infer_lock if self.backend != "pytorch" else _NullLock()
+            parts: list[np.ndarray] = []
+            with lock:
+                yield _to_pcm16(np.zeros(int(rate * LEADING_PAD_SEC), dtype=np.float32))
+                try:
+                    for chunk in model.infer_stream(text_prep, voice=voice_prep, **self._sampling()):
+                        if cancel is not None and cancel.is_set():
+                            return
+                        chunk = _as_float32(chunk)
+                        parts.append(chunk)
+                        yield _to_pcm16(chunk)
+                except Exception:
+                    logger.exception("VieNeu streaming failed")
+                    raise
+            yield _to_pcm16(np.zeros(int(rate * TRAILING_PAD_SEC), dtype=np.float32))
+            if parts:
+                self._cache_put(key, _encode_wav(np.concatenate(parts), rate))
+        except Exception as exc:
+            if isinstance(exc, TtsError) and exc.status_code < 500:
                 raise
-        yield _to_pcm16(np.zeros(int(rate * TRAILING_PAD_SEC), dtype=np.float32))
-        if parts:
-            self._cache_put(key, _encode_wav(np.concatenate(parts), rate))
+            if self.settings.tts_fallback_gemini and self._fallback:
+                logger.warning("VieNeu stream thất bại (%s), tự động chuyển sang Gemini TTS", exc)
+                yield from self._fallback.stream(text, voice, cancel)
+                return
+            if isinstance(exc, TtsError):
+                raise
+            raise
 
 
 class GeminiSynthesizer(_CachedSynthesizer):

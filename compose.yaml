@@ -5,7 +5,14 @@ services:
       - "127.0.0.1:8010:8000"
     env_file: .env
     volumes:
-      - models:/models  # Hugging Face cache for VieNeu weights
+      - models:/models  # Shared Hugging Face cache for both VieNeu (TTS) and Gipformer (STT) models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
 
 volumes:

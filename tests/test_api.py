@@ -196,7 +196,7 @@ def test_auto_device_without_torch_is_cpu(monkeypatch):
 
 
 @pytest.mark.parametrize("device,expected", [
-    ("cpu", {"mode": "v3turbo", "device": "cpu", "precision": "int8", "threads": 0}),
+    ("cpu", {"mode": "v3turbo", "device": "cpu", "precision": "fp32", "threads": 0}),
     ("cuda", {"mode": "v3turbo", "device": "cuda", "dtype": "float32", "max_batch_size": 32, "max_streams": 16}),
 ])
 def test_engine_options_per_device(monkeypatch, device, expected):

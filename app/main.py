@@ -1,6 +1,26 @@
 """Speech service: STT (Gemini transcribe API) + TTS (local VieNeu or Gemini TTS), plus a small test page."""
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
+# On Windows, ensure sherpa-onnx's bundled onnxruntime DLL takes precedence over System32
+if sys.platform == "win32":
+    try:
+        import ctypes
+        import importlib.util
+        spec = importlib.util.find_spec("sherpa_onnx")
+        if spec and spec.origin:
+            lib_dir = Path(spec.origin).parent / "lib"
+            if lib_dir.is_dir():
+                os.add_dll_directory(str(lib_dir))
+                dll_path = lib_dir / "onnxruntime.dll"
+                if dll_path.is_file():
+                    ctypes.CDLL(str(dll_path))
+    except Exception:
+        pass
+
 import asyncio
 import hmac
 import logging
@@ -15,7 +35,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings, split_csv
-from app.stt import GeminiTranscriber, SttError, resolve_mime_type
+from app.stt import GeminiTranscriber, ResilientTranscriber, SttError, create_transcriber, resolve_mime_type
 from app.stt_live import Connector, connect_gemini_live, relay_stream
 from app.tts import GeminiSynthesizer, TtsError, VieneuSynthesizer, create_synthesizer
 
@@ -36,10 +56,10 @@ class SttResponse(BaseModel):
     latency_ms: float
 
 
-def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber | None = None,
+def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber | ResilientTranscriber | None = None,
                synthesizer: VieneuSynthesizer | GeminiSynthesizer | None = None, live_connector: Connector | None = None) -> FastAPI:
     settings = settings or get_settings()
-    transcriber = transcriber or GeminiTranscriber(settings)
+    transcriber = transcriber or create_transcriber(settings)
     synthesizer = synthesizer or create_synthesizer(settings)
     live_connector = live_connector or connect_gemini_live
 
@@ -48,6 +68,8 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
         if settings.tts_preload and synthesizer.state == "idle":
             # Load in the background so /health answers while the model warms up.
             threading.Thread(target=_preload, args=(synthesizer,), daemon=True).start()
+        if getattr(settings, "gipformer_preload", True) and hasattr(transcriber, "gipformer") and transcriber.gipformer:
+            threading.Thread(target=_preload_stt, args=(transcriber.gipformer,), daemon=True).start()
         yield
         await transcriber.aclose()
 
@@ -75,10 +97,17 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
 
     @app.get("/health")
     async def health():
+        stt_provider = getattr(transcriber, "active_provider", "gemini")
+        stt_model = getattr(transcriber, "active_model", settings.stt_model)
+        stt_live_model = (
+            "gipformer-live"
+            if settings.stt_backend in ("gipformer", "auto") and hasattr(transcriber, "gipformer") and getattr(transcriber.gipformer, "configured", False)
+            else settings.stt_live_model
+        )
         return {
             "status": "ok" if transcriber.configured and synthesizer.state != "error" else "degraded",
             "auth_required": bool(settings.service_token),
-            "stt": {"provider": "gemini", "model": settings.stt_model, "live_model": settings.stt_live_model,
+            "stt": {"provider": stt_provider, "model": stt_model, "live_model": stt_live_model,
                     "configured": transcriber.configured,
                     "language_codes": settings.language_codes, "mode": settings.stt_mode},
             "tts": {"provider": synthesizer.provider, "model": synthesizer.model_name, "device": synthesizer.device,
@@ -170,6 +199,13 @@ def _preload(synthesizer: VieneuSynthesizer | GeminiSynthesizer) -> None:
         synthesizer.load()
     except TtsError:
         pass  # state/error are recorded on the synthesizer and surfaced by /health
+
+
+def _preload_stt(gipformer: Any) -> None:
+    try:
+        gipformer.load()
+    except Exception:
+        pass
 
 
 app = create_app()

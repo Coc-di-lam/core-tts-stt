@@ -28,9 +28,13 @@ phát lại, kèm thời gian từng bước; tùy chọn tự dừng khi Gemini
 `/v1/stt` (upload file) và `/v1/tts`. Lần chạy đầu tải weight VieNeu
 từ Hugging Face; `/health` báo `tts.state` = `loading` cho tới khi sẵn sàng.
 
-Docker: `docker compose up --build` (cổng `127.0.0.1:8010`, weight cache trong volume `models`). Image
-mặc định là bản CPU (không có torch). Muốn dùng GPU trong container thì cần image có `--extra cuda`, CUDA
-runtime và `gpus: all`; image hiện tại chưa làm phần này.
+Docker: `docker compose up --build` (cổng `127.0.0.1:8010`, weight cache trong volume `models`).
+Image hỗ trợ GPU NVIDIA (PyTorch CUDA runtime và GPU reservation trong `compose.yaml`).
+Khuyến nghị chạy build với giới hạn song song:
+```bash
+docker compose --parallel 1 up -d --build
+```
+do thư viện CUDA rất lớn (~3.5GB), tránh nghẽn RAM và I/O khi build song song cùng các container khác.
 
 Trên Windows không có GPU, nên chạy TTS trực tiếp (`uv run …`) thay vì Docker Desktop: đo trên cùng máy,
 trong container (VM WSL2, 8 vCPU dùng chung với các container khác) TTS chậm hơn ~3–4 lần (âm đầu

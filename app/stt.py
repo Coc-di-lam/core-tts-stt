@@ -103,8 +103,100 @@ class GeminiTranscriber:
         return Transcript(text=_output_text(payload), model=payload.get("model") or self.settings.stt_model,
                           language_codes=languages, mode=mode, latency_ms=latency_ms)
 
+    @property
+    def active_provider(self) -> str:
+        return "gemini"
+
+    @property
+    def active_model(self) -> str:
+        return self.settings.stt_model
+
     async def aclose(self) -> None:
         await self.client.aclose()
+
+
+class ResilientTranscriber:
+    """Combines Gipformer (local SOTA Vietnamese ASR) with automatic fallback to Gemini STT."""
+
+    def __init__(self, settings: Settings, gipformer: Any | None = None, gemini: GeminiTranscriber | None = None):
+        self.settings = settings
+        self.gemini = gemini or GeminiTranscriber(settings)
+        if gipformer is not None:
+            self.gipformer = gipformer
+        else:
+            try:
+                from app.stt_gipformer import GipformerTranscriber
+                self.gipformer = GipformerTranscriber(settings)
+            except Exception as exc:
+                self.gipformer = None
+
+    @property
+    def configured(self) -> bool:
+        backend = self.settings.stt_backend.strip().lower()
+        gip_ok = bool(self.gipformer and self.gipformer.configured and self.gipformer.is_available())
+        gem_ok = bool(self.gemini and self.gemini.configured)
+        if backend == "gemini":
+            return gem_ok
+        if backend == "gipformer":
+            return gip_ok
+        return gip_ok or gem_ok
+
+    @property
+    def active_provider(self) -> str:
+        backend = self.settings.stt_backend.strip().lower()
+        if backend == "gemini":
+            return "gemini"
+        if backend == "gipformer":
+            return "gipformer"
+        if self.gipformer is not None and self.gipformer.configured and self.gipformer.is_available():
+            return "gipformer"
+        return "gemini"
+
+    @property
+    def active_model(self) -> str:
+        backend = self.settings.stt_backend.strip().lower()
+        if backend == "gemini":
+            return self.settings.stt_model
+        if backend == "gipformer":
+            return getattr(self.gipformer, "model_name", "gipformer1.5-68M-rnnt")
+        if self.gipformer is not None and self.gipformer.configured and self.gipformer.is_available():
+            return self.gipformer.model_name
+        return self.settings.stt_model
+
+    async def transcribe(self, audio: bytes, mime_type: str, language_codes: list[str] | None = None,
+                         mode: str | None = None, vocabulary: list[str] | None = None) -> Transcript:
+        backend = self.settings.stt_backend.strip().lower()
+        if backend == "gemini":
+            return await self.gemini.transcribe(audio, mime_type, language_codes, mode, vocabulary)
+
+        if backend == "gipformer":
+            if self.gipformer is None or not self.gipformer.is_available():
+                raise SttError(503, "Gipformer STT chưa sẵn sàng hoặc chưa nạp xong.")
+            import asyncio
+            return await asyncio.to_thread(self.gipformer.transcribe, audio, mime_type, mode)
+
+        # backend == "auto":
+        if self.gipformer is not None and self.gipformer.is_available():
+            try:
+                import asyncio
+                return await asyncio.to_thread(self.gipformer.transcribe, audio, mime_type, mode)
+            except Exception as exc:
+                if not self.gemini.configured:
+                    raise
+                import logging
+                logging.getLogger(__name__).warning("Gipformer transcription failed (%s), falling back to Gemini STT", exc)
+
+        return await self.gemini.transcribe(audio, mime_type, language_codes, mode, vocabulary)
+
+    async def aclose(self) -> None:
+        await self.gemini.aclose()
+
+
+def create_transcriber(settings: Settings) -> GeminiTranscriber | ResilientTranscriber:
+    gemini = GeminiTranscriber(settings)
+    if settings.stt_backend.strip().lower() == "gemini":
+        return gemini
+    return ResilientTranscriber(settings, gemini=gemini)
 
 
 def _output_text(payload: dict) -> str:
