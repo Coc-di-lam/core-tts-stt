@@ -33,7 +33,7 @@ class Settings(BaseSettings):
 
     # TTS: local VieNeu (ONNX Runtime on CPU, PyTorch on CUDA)
     tts_model: str = "vieneu-v3-turbo"  # or "vieneu-v3-nano" for weak CPUs (24 kHz, own voice list)
-    tts_voice: str = "Hải Đăng"
+    tts_voice: str = "Trúc Ly"  # young female, natural Northern style (also in vieneu-v3-nano)
     tts_device: str = "auto"  # auto = cuda when PyTorch sees a GPU, else cpu
     tts_cpu_precision: str = "int8"  # "int8" (~1.5x faster, needs a VNNI CPU) | "fp32"
     tts_cpu_threads: int = 0  # 0 = engine default (~physical cores, max 8)
@@ -48,8 +48,8 @@ class Settings(BaseSettings):
 
     # TTS: Gemini (cloud), same GEMINI_API_KEY and Interactions endpoint as STT
     gemini_tts_model: str = "gemini-3.8-flash-lite-tts"
-    gemini_tts_voice: str = "Kore"
-    gemini_tts_style: str = ""  # optional delivery instruction, e.g. "calm, professional interviewer"
+    gemini_tts_voice: str = "Leda"  # youthful female
+    gemini_tts_style: str = "young, warm and friendly female interviewer"  # delivery instruction; empty = none
     gemini_tts_timeout_sec: float = 60.0
 
     # Service

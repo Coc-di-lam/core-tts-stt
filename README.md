@@ -129,6 +129,10 @@ Danh sách giọng preset của backend đang chạy (`id` dùng cho trường `
 nhưng chưa cài torch CUDA thì service vẫn chọn Gemini và ghi cảnh báo vào log. `/health` → `tts.provider`
 cho biết backend đang chạy.
 
+Giọng mặc định là nữ trẻ (người phỏng vấn Linh): VieNeu `Trúc Ly` (nữ, Bắc, tự nhiên; có cả ở v3-turbo và
+v3-nano), Gemini `Leda` (youthful) kèm `GEMINI_TTS_STYLE="young, warm and friendly female interviewer"`.
+Đổi bằng `TTS_VOICE` / `GEMINI_TTS_VOICE` / `GEMINI_TTS_STYLE`.
+
 Gemini TTS: giọng là bộ preset của Gemini (`Kore`, `Puck`, …; `GET /v1/tts/voices`), không phải giọng
 VieNeu. `/v1/tts/stream` trả PCM 24 kHz (`X-Sample-Rate: 24000`), cùng phần đệm im lặng và cache như VieNeu.
 Đo một lần trên máy này (flash-lite): âm đầu tiên ~2,8 s, câu ~3 s audio xong trong ~4,8 s, chậm hơn nhiều

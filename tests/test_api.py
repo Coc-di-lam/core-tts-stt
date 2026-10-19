@@ -272,7 +272,7 @@ def test_gemini_tts_stream_reassembles_split_samples():
     assert response.status_code == 200 and response.headers["X-Sample-Rate"] == "24000"
     lead, trail = int(24_000 * LEADING_PAD_SEC) * 2, int(24_000 * TRAILING_PAD_SEC) * 2
     assert response.content[lead:len(response.content) - trail] == pcm
-    assert response.headers["X-Voice"] == "Kore"
+    assert response.headers["X-Voice"] == "Leda"
 
 
 def test_gemini_tts_errors_surface_before_streaming():
@@ -287,7 +287,7 @@ def test_gemini_tts_health_and_voices():
     tts = client.get("/health").json()["tts"]
     assert tts["provider"] == "gemini" and tts["model"] == "gemini-3.8-flash-lite-tts" and tts["state"] == "ready"
     voices = client.get("/v1/tts/voices").json()
-    assert voices["default"] == "Kore" and {"id": "Puck", "label": "Puck"} in voices["voices"]
+    assert voices["default"] == "Leda" and {"id": "Puck", "label": "Puck"} in voices["voices"]
 
 
 @pytest.mark.parametrize("backend,cuda,expected", [
