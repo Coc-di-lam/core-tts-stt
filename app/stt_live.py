@@ -1,4 +1,4 @@
-"""Streaming speech-to-text: relay a client WebSocket to the Gemini Live transcription model.
+"""Streaming speech-to-text: relay a client WebSocket to ElevenLabs Scribe v2 Realtime (or local Gipformer).
 
 Client protocol (`WS /v1/stt/stream`):
   -> {"type": "start", "language"?, "mode"?, "vocabulary"?, "fluency"?, "token"?}   first message, required
@@ -7,12 +7,11 @@ Client protocol (`WS /v1/stt/stream`):
   -> {"type": "stop"}   close the session (or just close the socket)
   <- {"type": "ready", "model", "setup_ms"}
   <- {"type": "interim", "text"}   running text of the current turn, revised while speaking
-  <- {"type": "vad", "event": "start" | "end"}   Gemini server-side voice activity
+  <- {"type": "vad", "event": "start" | "end"}   voice activity
   <- {"type": "final", "text", "latency_ms"}   whole turn; latency counts from "end"
      with "fluency": true also "verbatim" (raw, with fillers) and "fluency" (app/fluency.py metrics);
-     Gemini then runs in verbatim mode and "text" is the verbatim transcript without fillers
+     mode runs verbatim and "text" is the transcript without fillers
   <- {"type": "error", "detail"}
-One session can carry several turns; Gemini caps a live session at ~10 minutes.
 """
 from __future__ import annotations
 
@@ -24,21 +23,23 @@ import json
 import logging
 import time
 from typing import Any, Awaitable, Callable, Protocol
+from urllib.parse import urlencode
 
 from fastapi import WebSocket, WebSocketDisconnect
+from websockets.exceptions import ConnectionClosedOK
 
 from app import fluency
 from app.config import Settings, split_csv
+from app.stt import _map_language_code
 
 logger = logging.getLogger(__name__)
 
-PCM_MIME_TYPE = "audio/pcm;rate=16000"
 MAX_FRAME_BYTES = 64 * 1024
 MAX_TURN_PCM_BYTES = 16_000 * 2 * 600  # keep up to 10 min of a turn for fluency analysis
 
 
 class Upstream(Protocol):
-    async def send(self, message: str) -> None: ...
+    async def send(self, message: str | bytes) -> None: ...
     async def close(self) -> None: ...
     def __aiter__(self): ...
 
@@ -50,35 +51,44 @@ class LiveSetupError(Exception):
     pass
 
 
-async def connect_gemini_live(settings: Settings, language_codes: list[str], mode: str,
-                              vocabulary: list[str]) -> Upstream:
+async def connect_elevenlabs_live(settings: Settings, language_codes: list[str], mode: str,
+                                  vocabulary: list[str]) -> Upstream:
     from websockets.asyncio.client import connect
 
-    transcription: dict[str, Any] = {"languageCodes": language_codes}
-    if mode == "smart":
-        transcription["mode"] = "SMART"  # Gemini's default is verbatim
-    if vocabulary:
-        transcription["customVocabulary"] = vocabulary[:1000]
-    ws = await connect(settings.gemini_live_url, additional_headers={"x-goog-api-key": settings.gemini_api_key},
-                       max_size=None, open_timeout=settings.stt_live_setup_timeout_sec)
+    lang = _map_language_code(language_codes) or settings.stt_language_code
+    params = {
+        "model_id": settings.stt_live_model,
+        "audio_format": "pcm_16000",
+    }
+    if lang:
+        params["language_code"] = lang
+
+    url = f"{settings.stt_live_ws_url}?{urlencode(params)}"
+    headers = {"xi-api-key": settings.elevenlabs_api_key}
+
+    ws = await connect(url, additional_headers=headers, max_size=None,
+                       open_timeout=settings.stt_live_setup_timeout_sec)
     try:
-        await ws.send(json.dumps({"setup": {
-            "model": f"models/{settings.stt_live_model}",
-            "generationConfig": {"responseModalities": ["TEXT"]},
-            "inputAudioTranscription": transcription,
-        }}))
-        reply = json.loads(await asyncio.wait_for(ws.recv(), settings.stt_live_setup_timeout_sec))
+        reply_raw = await asyncio.wait_for(ws.recv(), settings.stt_live_setup_timeout_sec)
+        reply = json.loads(reply_raw)
     except BaseException:
         await ws.close()
         raise
-    if "setupComplete" not in reply:
+
+    msg_type = reply.get("message_type")
+    if msg_type != "session_started":
         await ws.close()
-        raise LiveSetupError(str(reply.get("error") or reply)[:300])
+        raise LiveSetupError(f"ElevenLabs live setup failed: {reply.get('error') or reply}")
+
     return ws
 
 
+# Backward-compatible alias
+connect_gemini_live = connect_elevenlabs_live
+
+
 class _Turn:
-    """Accumulates Gemini segments until the client ends the turn."""
+    """Accumulates transcription segments until the client ends the turn."""
 
     def __init__(self) -> None:
         self.segments: list[str] = []
@@ -86,6 +96,7 @@ class _Turn:
         self.speaking = False
         self.ended_at: float | None = None
         self.pcm = bytearray()
+        self.frames_received = 0
 
     def text(self) -> str:
         return " ".join(part for part in [*self.segments, self.interim] if part).strip()
@@ -94,7 +105,8 @@ class _Turn:
         self.__init__()
 
 
-async def relay_stream(client: WebSocket, settings: Settings, connector: Connector) -> None:
+async def relay_stream(client: WebSocket, settings: Settings, connector: Connector | None = None) -> None:
+    connector = connector or connect_elevenlabs_live
     await client.accept()
     try:
         start = await asyncio.wait_for(client.receive_json(), settings.stt_live_setup_timeout_sec)
@@ -109,7 +121,7 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
         return
 
     backend = settings.stt_backend.strip().lower()
-    if connector == connect_gemini_live and backend in ("gipformer", "auto"):
+    if backend in ("gipformer", "auto"):
         try:
             from app.stt_gipformer import GipformerTranscriber
             gip = GipformerTranscriber(settings)
@@ -123,11 +135,12 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
             if backend == "gipformer":
                 await _close(client, 1011, f"Gipformer không khả dụng: {exc}")
                 return
-            logger.warning("Gipformer live stream failed to init (%s), falling back to Gemini Live", exc)
+            logger.warning("Gipformer live stream failed (%s), falling back to ElevenLabs Scribe", exc)
 
-    if not settings.gemini_api_key:
-        await _close(client, 1011, "Chưa cấu hình GEMINI_API_KEY.")
+    if not settings.elevenlabs_api_key:
+        await _close(client, 1011, "Chưa cấu hình ELEVENLABS_API_KEY.")
         return
+
     language = start.get("language")
     languages = settings.language_codes if language is None else (
         [] if str(language).strip().lower() == "auto" else split_csv(str(language)))
@@ -137,21 +150,27 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
         return
     measure = bool(start.get("fluency"))
     if measure:
-        mode = "verbatim"  # smart mode drops the fillers and repetitions being measured
+        mode = "verbatim"
 
     started = time.perf_counter()
     try:
         upstream = await connector(settings, languages, mode, split_csv(start.get("vocabulary")))
     except Exception as exc:
-        logger.exception("Gemini Live setup failed")
-        await _close(client, 1011, f"Không mở được Gemini Live: {type(exc).__name__}: {str(exc)[:200]}")
+        logger.exception("ElevenLabs Live setup failed")
+        await _close(client, 1011, f"Không mở được ElevenLabs Live: {type(exc).__name__}: {str(exc)[:200]}")
         return
-    await client.send_json({"type": "ready", "model": settings.stt_live_model,
-                            "language_codes": languages, "mode": mode, "fluency": measure,
-                            "setup_ms": round((time.perf_counter() - started) * 1000, 1)})
+
+    await client.send_json({
+        "type": "ready",
+        "model": settings.stt_live_model,
+        "language_codes": languages,
+        "mode": mode,
+        "fluency": measure,
+        "setup_ms": round((time.perf_counter() - started) * 1000, 1),
+    })
 
     turn = _Turn()
-    lock = asyncio.Lock()  # serializes "final" between the upstream pump and the end-of-turn timer
+    lock = asyncio.Lock()
     timer: asyncio.Task | None = None
 
     async def emit_final() -> None:
@@ -161,7 +180,7 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
                 return
             message = {"type": "final", "text": turn.text()}
             if measure:
-                clean, metrics = fluency.analyze(bytes(turn.pcm), message["text"])
+                clean, metrics = fluency.analyze(bytes(turn.pcm), turn.text())
                 message.update(text=clean, verbatim=turn.text(), fluency=metrics)
             message["latency_ms"] = round((time.perf_counter() - turn.ended_at) * 1000, 1)
             await client.send_json(message)
@@ -186,22 +205,26 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
                     await client.send_json({"type": "error", "detail": "Frame audio phải là PCM16 và ≤ 64 KB."})
                     continue
                 if turn.ended_at is None and frame:
+                    turn.frames_received += 1
                     if measure and len(turn.pcm) < MAX_TURN_PCM_BYTES:
                         turn.pcm.extend(frame)
-                    await upstream.send(json.dumps({"realtimeInput": {"audio": {
-                        "data": base64.b64encode(frame).decode("ascii"), "mimeType": PCM_MIME_TYPE}}}))
+                    b64 = base64.b64encode(frame).decode("ascii")
+                    await upstream.send(json.dumps({"message_type": "input_audio_chunk", "audio_base_64": b64}))
                 continue
+
             try:
                 command = json.loads(message.get("text") or "{}").get("type")
             except (ValueError, AttributeError):
                 command = None
+
             if command == "stop":
                 return
             if command == "end" and turn.ended_at is None:
                 turn.ended_at = time.perf_counter()
-                await upstream.send(json.dumps({"realtimeInput": {"audioStreamEnd": True}}))
-                if not turn.speaking and not turn.interim:
-                    await emit_final()  # nothing pending: Gemini sends no reply for silence
+                with contextlib.suppress(Exception):
+                    await upstream.send(json.dumps({"message_type": "input_audio_chunk", "audio_base_64": "", "commit": True}))
+                if turn.frames_received == 0:
+                    await emit_final()
                 else:
                     timer = asyncio.create_task(final_after_timeout())
             elif command not in {"end"}:
@@ -209,39 +232,61 @@ async def relay_stream(client: WebSocket, settings: Settings, connector: Connect
 
     async def pump_upstream() -> None:
         async for raw in upstream:
-            data = json.loads(raw)
-            content = data.get("serverContent") or {}
-            if "interimInputTranscription" in content:
-                turn.interim = (content["interimInputTranscription"].get("text") or "").strip()
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+
+            msg_type = data.get("message_type") or data.get("type")
+
+            # Partial transcript: interim update while user speaks
+            if msg_type in ("partial_transcript", "interim"):
+                text = (data.get("text") or data.get("transcript") or "").strip()
+                turn.interim = text
+                if not turn.speaking and text:
+                    turn.speaking = True
+                    await client.send_json({"type": "vad", "event": "start"})
                 await client.send_json({"type": "interim", "text": turn.text()})
-            if "inputTranscription" in content:
-                segment = (content["inputTranscription"].get("text") or "").strip()
-                turn.interim = ""
+
+            # Committed transcript: final segment
+            elif msg_type in ("committed_transcript", "final_transcript", "final_segment"):
+                segment = (data.get("text") or data.get("transcript") or "").strip()
                 if segment:
                     turn.segments.append(segment)
+                    turn.interim = ""
+                elif not turn.segments and turn.interim:
+                    turn.segments.append(turn.interim)
+                    turn.interim = ""
+                else:
+                    turn.interim = ""
                 await client.send_json({"type": "interim", "text": turn.text()})
-            if content.get("generationComplete") and turn.ended_at is not None:
-                await emit_final()
-            activity = (data.get("voiceActivity") or {}).get("type")
-            if activity in {"ACTIVITY_START", "ACTIVITY_END"}:
-                turn.speaking = activity == "ACTIVITY_START"
-                await client.send_json({"type": "vad", "event": "start" if turn.speaking else "end"})
-            if "goAway" in data:
-                await client.send_json({"type": "error", "detail": "Gemini sắp đóng phiên live (goAway)."})
-            if "error" in data:
-                await client.send_json({"type": "error", "detail": str(data["error"])[:300]})
+                if turn.ended_at is not None:
+                    await emit_final()
+
+            # Voice activity detection (if model provides VAD events)
+            elif msg_type in ("vad_start", "speech_started"):
+                turn.speaking = True
+                await client.send_json({"type": "vad", "event": "start"})
+            elif msg_type in ("vad_end", "speech_ended"):
+                turn.speaking = False
+                await client.send_json({"type": "vad", "event": "end"})
+
+            elif msg_type in ("error", "invalid_audio"):
+                detail = str(data.get("message") or data.get("detail") or data)[:300]
+                await client.send_json({"type": "error", "detail": detail})
 
     tasks = [asyncio.create_task(pump_client()), asyncio.create_task(pump_upstream())]
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
-            if task.exception() and not isinstance(task.exception(), WebSocketDisconnect):
-                logger.warning("Live STT relay ended: %r", task.exception())
+            exc = task.exception()
+            if exc and not isinstance(exc, (WebSocketDisconnect, ConnectionClosedOK)):
+                logger.warning("Live STT relay ended: %r", exc)
                 with contextlib.suppress(Exception):
-                    await client.send_json({"type": "error", "detail": f"Phiên live lỗi: {type(task.exception()).__name__}"})
+                    await client.send_json({"type": "error", "detail": f"Phiên live lỗi: {type(exc).__name__}"})
         if tasks[1] in done:
             with contextlib.suppress(Exception):
-                await emit_final()  # Gemini closed the session; flush what we have
+                await emit_final()
     finally:
         for task in [*tasks, timer]:
             if task is not None:
@@ -282,7 +327,6 @@ async def relay_stream_gipformer(client: WebSocket, settings: Settings, start: d
         nonlocal last_interim_len
         async with interim_lock:
             current_len = len(pcm_buffer)
-            # Only update if we have at least 0.5s of audio and 0.4s new audio
             if current_len < 16000 or current_len - last_interim_len < 12800:
                 return
             last_interim_len = current_len
@@ -343,4 +387,3 @@ async def relay_stream_gipformer(client: WebSocket, settings: Settings, start: d
             interim_task.cancel()
         with contextlib.suppress(Exception):
             await client.close()
-

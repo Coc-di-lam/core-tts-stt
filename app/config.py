@@ -12,8 +12,13 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ROOT_DIR / ".env", env_file_encoding="utf-8", extra="ignore")
 
-    # STT backend: "auto" = Gipformer local (if available), fallback to Gemini | "gipformer" | "gemini"
-    stt_backend: str = "auto"
+    # ElevenLabs credentials
+    elevenlabs_api_key: str = ""
+    elevenlabs_api_url: str = "https://api.elevenlabs.io"
+
+    # STT backend: "auto" = Gipformer local (if available), fallback to ElevenLabs | "gipformer" | "elevenlabs"
+    stt_backend: str = "elevenlabs"
+    stt_fallback_online: bool = True  # Automatically fallback to ElevenLabs STT if Gipformer is unavailable/fails
 
     # STT: local Gipformer (g-group-ai-lab/gipformer1.5-68M-rnnt, Zipformer RNN-T)
     gipformer_version: str = "1.5"  # "1.5" (latest 68M) | "1"
@@ -22,27 +27,24 @@ class Settings(BaseSettings):
     gipformer_model_dir: str = ""  # empty = HuggingFace cache
     gipformer_num_threads: int = 4
     gipformer_preload: bool = True
-    stt_fallback_gemini: bool = True  # Automatically fallback to Gemini STT if Gipformer is unavailable/fails
 
-    # STT (batch): Gemini transcription API
-    gemini_api_key: str = ""
-    gemini_api_url: str = "https://generativelanguage.googleapis.com/v1beta/interactions"
-    stt_model: str = "gemini-3.5-transcribe"
-    stt_language_codes: str = "vi-VN"  # comma-separated BCP-47; empty = auto-detect
+    # STT (batch): ElevenLabs Scribe v2 API
+    stt_model: str = "scribe_v2"
+    stt_language_code: str = "vie"  # ISO-639-3 or ISO-639-1: "vie" or empty for auto-detect
+    stt_language_codes: str = "vi-VN"  # comma-separated BCP-47 for backward compatibility
     stt_mode: str = "smart"  # "smart" | "verbatim"
     stt_timeout_sec: float = 60.0
-    stt_max_bytes: int = 15 * 1024 * 1024  # inline audio; base64 adds ~33% to the request
+    stt_max_bytes: int = 25 * 1024 * 1024
 
-    # Streaming STT: Gemini Live API
-    gemini_live_url: str = ("wss://generativelanguage.googleapis.com/ws/"
-                            "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
-    stt_live_model: str = "gemini-3.5-transcribe-live"
+    # Streaming STT: ElevenLabs Scribe v2 Realtime WebSocket API
+    stt_live_ws_url: str = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
+    stt_live_model: str = "scribe_v2_realtime"
     stt_live_setup_timeout_sec: float = 10.0
-    stt_live_final_timeout_sec: float = 3.0  # wait this long after "end" for Gemini's last segment
+    stt_live_final_timeout_sec: float = 3.0  # wait this long after "end" for last segment
 
-    # TTS backend: "auto" = VieNeu on an NVIDIA GPU (max settings), else Gemini TTS | "vieneu" | "gemini"
-    tts_backend: str = "auto"
-    tts_fallback_gemini: bool = True  # Automatically fallback to Gemini TTS if VieNeu fails
+    # TTS backend: "auto" = VieNeu on an NVIDIA GPU, else ElevenLabs v4 Turbo | "vieneu" | "elevenlabs"
+    tts_backend: str = "elevenlabs"
+    tts_fallback_online: bool = True  # Automatically fallback to ElevenLabs TTS if VieNeu fails
 
     # TTS: local VieNeu (ONNX Runtime on CPU, PyTorch on CUDA)
     tts_model: str = "vieneu-v3-turbo"  # or "vieneu-v3-nano" for weak CPUs (24 kHz, own voice list)
@@ -59,13 +61,14 @@ class Settings(BaseSettings):
     tts_top_k: int = 25
     tts_top_p: float = 0.95
     tts_repetition_penalty: float = 1.2
-    tts_apply_watermark: bool = False  # False = purest uncompressed audio without acoustic watermark
+    tts_apply_watermark: bool = False
 
-    # TTS: Gemini (cloud), same GEMINI_API_KEY and Interactions endpoint as STT
-    gemini_tts_model: str = "gemini-3.8-flash-lite-tts"
-    gemini_tts_voice: str = "Leda"  # youthful female
-    gemini_tts_style: str = "young, warm and friendly female interviewer"  # delivery instruction; empty = none
-    gemini_tts_timeout_sec: float = 60.0
+    # TTS: ElevenLabs v4 Turbo (cloud)
+    elevenlabs_tts_model: str = "eleven_v4_turbo"
+    elevenlabs_tts_voice: str = "A5w1fw5x0uXded1LDvZp"  # Nhu - Calm and Confident (professional female interviewer)
+    elevenlabs_tts_output_format: str = "pcm_48000"  # pcm_48000 (48 kHz) | pcm_24000
+    elevenlabs_tts_sample_rate: int = 48000
+    elevenlabs_tts_timeout_sec: float = 60.0
 
     # Service
     service_token: str = ""  # when set, /v1/* requires "Authorization: Bearer <token>"

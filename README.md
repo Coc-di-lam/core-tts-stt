@@ -6,8 +6,8 @@ trước và sau core.
 
 | Chức năng | Model | Chạy ở đâu |
 |---|---|---|
-| STT streaming | `gemini-3.5-transcribe-live` ([docs](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)) | Google Live API, service làm relay WebSocket (API key không lộ ra client) |
-| STT batch | `gemini-3.5-transcribe` ([docs](https://ai.google.dev/gemini-api/docs/transcribe)) | Google API, audio gửi inline |
+| STT streaming | `scribe_v2_realtime (ElevenLabs Scribe v2)` ([docs](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)) | Google Live API, service làm relay WebSocket (API key không lộ ra client) |
+| STT batch | `scribe_v2 (ElevenLabs Scribe v2)` ([docs](https://ai.google.dev/gemini-api/docs/transcribe)) | Google API, audio gửi inline |
 | TTS | VieNeu-TTS v3 Turbo, 48 kHz **hoặc** `gemini-3.8-flash-lite-tts`, 24 kHz ([docs](https://ai.google.dev/gemini-api/docs/speech-generation)) | `TTS_BACKEND=auto`: có GPU NVIDIA → VieNeu local (PyTorch/CUDA, fp32); không có → Gemini TTS. Xem [Chọn backend TTS](#chọn-backend-tts) |
 
 ```
@@ -18,7 +18,7 @@ core ──response_token──▶ Gateway (cắt theo câu) ──▶ POST /v1/
 ## Chạy local
 
 ```powershell
-copy .env.example .env      # điền GEMINI_API_KEY
+copy .env.example .env      # điền ELEVENLABS_API_KEY
 uv sync
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8010
 ```
@@ -91,7 +91,7 @@ nên tiếng ồn nền lớn làm số liệu kém chính xác.
 | `vocabulary` | không | Thuật ngữ cần nhận đúng, phân tách bằng dấu phẩy (`Kubernetes,FastAPI`) |
 
 ```json
-{"text": "Em đã triển khai hệ thống bằng FastAPI và Redis.", "model": "gemini-3.5-transcribe",
+{"text": "Em đã triển khai hệ thống bằng FastAPI và Redis.", "model": "scribe_v2 (ElevenLabs Scribe v2)",
  "language_codes": ["vi-VN"], "mode": "smart", "latency_ms": 3684.3}
 ```
 
@@ -117,7 +117,7 @@ Danh sách giọng preset của backend đang chạy (`id` dùng cho trường `
 
 `400` audio/văn bản rỗng · `401` sai token · `413` vượt giới hạn · `415` định dạng audio không hỗ trợ ·
 `422` giọng/mode không hợp lệ · `502`/`504` Gemini lỗi hoặc quá thời gian · `503` thiếu
-`GEMINI_API_KEY` hoặc VieNeu không tải được.
+`ELEVENLABS_API_KEY` hoặc VieNeu không tải được.
 
 ## Chọn backend TTS
 
@@ -127,7 +127,7 @@ Danh sách giọng preset của backend đang chạy (`id` dùng cho trường `
 |---|---|
 | `auto` (mặc định, hoặc bỏ trống) | PyTorch thấy GPU NVIDIA → VieNeu trên CUDA với cấu hình cao nhất (Turbo 48 kHz, `TTS_GPU_DTYPE=float32`, batch 32, 16 luồng stream). Không có GPU → Gemini TTS |
 | `vieneu` | Luôn dùng VieNeu local; `TTS_DEVICE` (`auto`/`cpu`/`cuda`) chọn thiết bị, như mục dưới |
-| `gemini` | Luôn dùng Gemini TTS (`GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`, `GEMINI_TTS_STYLE`), cần `GEMINI_API_KEY` |
+| `gemini` | Luôn dùng Gemini TTS (`GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`, `GEMINI_TTS_STYLE`), cần `ELEVENLABS_API_KEY` |
 
 "Có GPU" nghĩa là đã `uv sync --extra cuda` và `torch.cuda.is_available()` là `True`. Máy có GPU NVIDIA
 nhưng chưa cài torch CUDA thì service vẫn chọn Gemini và ghi cảnh báo vào log. `/health` → `tts.provider`
@@ -184,7 +184,7 @@ Test dùng Gemini giả (`httpx.MockTransport`, Live API giả) và VieNeu giả
 
 ## Cấu hình
 
-Xem `.env.example`. Các biến chính: `GEMINI_API_KEY`, `STT_LIVE_MODEL`, `STT_LIVE_FINAL_TIMEOUT_SEC`, `STT_MODEL`, `STT_LANGUAGE_CODES`, `STT_MODE`,
+Xem `.env.example`. Các biến chính: `ELEVENLABS_API_KEY`, `STT_LIVE_MODEL`, `STT_LIVE_FINAL_TIMEOUT_SEC`, `STT_MODEL`, `STT_LANGUAGE_CODES`, `STT_MODE`,
 `TTS_BACKEND` (`auto` | `vieneu` | `gemini`), `GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`, `GEMINI_TTS_STYLE`,
 `TTS_MODEL`, `TTS_VOICE`, `TTS_DEVICE` (`auto` | `cpu` | `cuda`), `TTS_CPU_PRECISION`, `TTS_CPU_THREADS`, `TTS_GPU_DTYPE`, `TTS_PRELOAD`,
 `SERVICE_TOKEN`, `CORS_ORIGINS`.

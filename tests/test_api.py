@@ -1,4 +1,3 @@
-import base64
 import io
 import json
 
@@ -10,9 +9,9 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from app.stt import GeminiTranscriber
-from app.tts import (LEADING_PAD_SEC, TRAILING_PAD_SEC, GeminiSynthesizer, VieneuSynthesizer,
-                     create_synthesizer)
+from app.stt import ElevenLabsTranscriber, GeminiTranscriber
+from app.tts import (LEADING_PAD_SEC, TRAILING_PAD_SEC, ElevenLabsSynthesizer, GeminiSynthesizer,
+                     VieneuSynthesizer, create_synthesizer)
 
 
 class FakeVieneu:
@@ -38,26 +37,28 @@ class FakeVieneu:
             yield np.full(self.sample_rate // 4, 0.1, dtype=np.float32)
 
 
-def gemini_ok(text="Xin chào"):
-    return {"status": "completed", "model": "gemini-3.5-transcribe",
-            "steps": [{"type": "model_output", "content": [{"type": "text", "text": text}]}]}
+def elevenlabs_ok(text="Xin chào"):
+    return {"text": text, "language_code": "vie"}
 
 
 def make_client(handler, **overrides):
-    settings = Settings(_env_file=None, gemini_api_key="test-key", tts_preload=False, **overrides)
-    transcriber = GeminiTranscriber(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    settings = Settings(_env_file=None, elevenlabs_api_key="test-key", tts_preload=False, **overrides)
+    transcriber = ElevenLabsTranscriber(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     fake = FakeVieneu()
     app = create_app(settings, transcriber, VieneuSynthesizer(settings, model=fake))
     return TestClient(app), fake
 
 
-def test_stt_sends_inline_audio_with_transcription_config():
+def test_stt_sends_multipart_to_elevenlabs_scribe():
     captured = {}
 
     def handler(request: httpx.Request):
-        captured["key"] = request.headers["x-goog-api-key"]
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json=gemini_ok("Tôi dùng Kubernetes"))
+        captured["key"] = request.headers.get("xi-api-key")
+        captured["content_type"] = request.headers.get("content-type")
+        content = request.content.decode("latin1")
+        captured["has_file"] = "filename=\"audio.webm\"" in content
+        captured["has_model"] = "scribe_v2" in content
+        return httpx.Response(200, json=elevenlabs_ok("Tôi dùng Kubernetes"))
 
     client, _ = make_client(handler)
     response = client.post("/v1/stt", files={"file": ("a.webm", b"opus-bytes", "audio/webm;codecs=opus")},
@@ -65,28 +66,21 @@ def test_stt_sends_inline_audio_with_transcription_config():
 
     assert response.status_code == 200
     assert response.json()["text"] == "Tôi dùng Kubernetes"
-    body = captured["body"]
     assert captured["key"] == "test-key"
-    assert body["model"] == "gemini-3.5-transcribe"
-    assert body["input"][0] == {"type": "audio", "mime_type": "audio/webm",
-                                "data": base64.b64encode(b"opus-bytes").decode()}
-    assert body["generation_config"]["transcription_config"] == {
-        "mode": "smart", "language_codes": ["vi-VN"], "custom_vocabulary": ["Kubernetes", "Redis"]}
+    assert captured["has_file"] is True
+    assert captured["has_model"] is True
 
 
 def test_stt_auto_language_and_verbatim_mode():
-    captured = {}
-
     def handler(request):
-        captured["config"] = json.loads(request.content)["generation_config"]["transcription_config"]
-        return httpx.Response(200, json=gemini_ok())
+        return httpx.Response(200, json=elevenlabs_ok("xin chao"))
 
     client, _ = make_client(handler)
     response = client.post("/v1/stt", files={"file": ("a.wav", b"RIFF", "audio/wav")},
                            data={"language": "auto", "mode": "verbatim"})
 
     assert response.status_code == 200
-    assert captured["config"] == {"mode": {"type": "verbatim"}}
+    assert response.json()["mode"] == "verbatim"
 
 
 @pytest.mark.parametrize("content_type,filename,status", [
@@ -94,20 +88,20 @@ def test_stt_auto_language_and_verbatim_mode():
     ("audio/wav", "a.wav", 400),  # empty file
 ])
 def test_stt_rejects_bad_input(content_type, filename, status):
-    client, _ = make_client(lambda request: httpx.Response(200, json=gemini_ok()))
+    client, _ = make_client(lambda request: httpx.Response(200, json=elevenlabs_ok()))
     response = client.post("/v1/stt", files={"file": (filename, b"" if status == 400 else b"x", content_type)})
     assert response.status_code == status
 
 
-def test_stt_maps_gemini_errors():
-    client, _ = make_client(lambda request: httpx.Response(503, json={"error": {"message": "overloaded"}}))
+def test_stt_maps_elevenlabs_errors():
+    client, _ = make_client(lambda request: httpx.Response(503, json={"detail": "overloaded"}))
     response = client.post("/v1/stt", files={"file": ("a.wav", b"RIFF", "audio/wav")})
     assert response.status_code == 502
     assert "overloaded" in response.json()["detail"]
 
 
 def test_stt_without_api_key_is_unavailable():
-    settings = Settings(_env_file=None, gemini_api_key="", tts_preload=False)
+    settings = Settings(_env_file=None, elevenlabs_api_key="", tts_preload=False)
     app = create_app(settings, synthesizer=VieneuSynthesizer(settings, model=FakeVieneu()))
     client = TestClient(app)
     assert client.get("/health").json()["stt"]["configured"] is False
@@ -143,7 +137,7 @@ def test_voices_strip_star_marker():
 
 
 def test_service_token_guards_v1_but_not_health_or_page():
-    client, _ = make_client(lambda request: httpx.Response(200, json=gemini_ok()), service_token="s3cret")
+    client, _ = make_client(lambda request: httpx.Response(200, json=elevenlabs_ok()), service_token="s3cret")
     assert client.get("/health").status_code == 200
     assert client.get("/").status_code == 200
     assert client.get("/v1/tts/voices").status_code == 401
@@ -162,7 +156,6 @@ def test_tts_stream_yields_padded_pcm_then_serves_cache():
     assert samples == pytest.approx(48_000 * (1 + LEADING_PAD_SEC + TRAILING_PAD_SEC), abs=4)
     assert second.content == first.content
     assert fake.stream_calls == 1
-    # The streamed clip also feeds the whole-clip cache.
     assert client.post("/v1/tts", json={"text": "Xin chào", "voice": "Mai Anh"}).headers["X-Cache-Hit"] == "true"
 
 
@@ -191,7 +184,7 @@ def test_auto_device_without_torch_is_cpu(monkeypatch):
 
     from app.tts import resolve_device
 
-    monkeypatch.setitem(sys.modules, "torch", None)  # import torch -> ImportError
+    monkeypatch.setitem(sys.modules, "torch", None)
     assert resolve_device("auto") == "cpu"
 
 
@@ -210,97 +203,87 @@ def test_engine_options_per_device(monkeypatch, device, expected):
     assert synthesizer.state == "ready" and synthesizer.default_voice == "Hải Đăng"
 
 
-# ---- Gemini TTS backend ----
+# ---- ElevenLabs TTS backend ----
 
-def _pcm(seconds, rate=24_000):
+def _pcm(seconds, rate=48_000):
     return (np.full(int(rate * seconds), 0.1, dtype=np.float32) * 32767).astype("<i2").tobytes()
 
 
-def make_gemini_client(handler, **overrides):
-    settings = Settings(_env_file=None, gemini_api_key="test-key", tts_preload=False, tts_backend="gemini",
-                        **overrides)
-    synthesizer = GeminiSynthesizer(settings, httpx.Client(transport=httpx.MockTransport(handler)))
-    transcriber = GeminiTranscriber(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+def make_elevenlabs_client(handler, **overrides):
+    settings = Settings(_env_file=None, elevenlabs_api_key="test-key", tts_preload=False, tts_backend="elevenlabs",
+                        elevenlabs_tts_voice="cgSgspJ2msm6clMCkdW9", **overrides)
+    synthesizer = ElevenLabsSynthesizer(settings, httpx.Client(transport=httpx.MockTransport(handler)))
+    transcriber = ElevenLabsTranscriber(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     return TestClient(create_app(settings, transcriber, synthesizer))
 
 
-def test_gemini_tts_whole_clip_request_and_cache():
+def test_elevenlabs_tts_whole_clip_request_and_cache():
     calls = []
 
-    def handler(request):
-        calls.append(json.loads(request.content))
-        data = base64.b64encode(_pcm(1.0)).decode()
-        return httpx.Response(200, json={"steps": [{"type": "model_output",
-                                                    "content": [{"type": "audio", "data": data}]}]})
+    def handler(request: httpx.Request):
+        calls.append(request)
+        return httpx.Response(200, content=_pcm(1.0, 48_000), headers={"content-type": "audio/pcm"})
 
-    client = make_gemini_client(handler, gemini_tts_style="calm")
-    first = client.post("/v1/tts", json={"text": "Xin chào", "voice": "Puck"})
-    second = client.post("/v1/tts", json={"text": "Xin chào", "voice": "Puck"})
+    client = make_elevenlabs_client(handler)
+    first = client.post("/v1/tts", json={"text": "Xin chào", "voice": "cgSgspJ2msm6clMCkdW9"})
+    second = client.post("/v1/tts", json={"text": "Xin chào", "voice": "cgSgspJ2msm6clMCkdW9"})
 
     assert first.status_code == 200
     data, rate = sf.read(io.BytesIO(first.content))
-    assert rate == 24_000
+    assert rate == 48_000
     assert float(first.headers["X-Audio-Duration"]) == pytest.approx(1.0)
     assert second.headers["X-Cache-Hit"] == "true" and len(calls) == 1
-    assert calls[0] == {
-        "model": "gemini-3.8-flash-lite-tts",
-        "input": [{"type": "user_input", "content": [{"type": "text", "text": "Xin chào", "annotations": [
-            {"type": "speech_metadata", "style": "calm"}]}]}],
-        "response_format": {"type": "audio", "mime_type": "audio/l16", "sample_rate": 24_000},
-        "generation_config": {"speech_config": [{"voice": "Puck"}]},
-    }
+    assert calls[0].headers["xi-api-key"] == "test-key"
+    assert "text-to-speech/cgSgspJ2msm6clMCkdW9" in str(calls[0].url)
 
 
-def test_gemini_tts_stream_reassembles_split_samples():
-    pcm = _pcm(0.5)
-    split = 1001  # odd: one sample straddles two deltas
+def test_elevenlabs_tts_stream():
+    pcm = _pcm(0.5, 48_000)
 
-    def handler(request):
-        assert json.loads(request.content)["stream"] is True
-        events = [{"event_type": "step.start", "index": 1, "step": {"type": "model_output"}}]
-        events += [{"event_type": "step.delta", "index": 1,
-                    "delta": {"type": "audio", "data": base64.b64encode(chunk).decode()}}
-                   for chunk in (pcm[:split], pcm[split:])]
-        events.append({"event_type": "interaction.completed", "interaction": {"status": "completed"}})
-        body = "".join(f"event: {e['event_type']}\ndata: {json.dumps(e)}\n\n" for e in events)
-        return httpx.Response(200, text=body + "event: done\ndata: [DONE]\n\n",
-                              headers={"content-type": "text/event-stream"})
+    def handler(request: httpx.Request):
+        return httpx.Response(200, content=pcm, headers={"content-type": "audio/pcm"})
 
-    client = make_gemini_client(handler)
+    client = make_elevenlabs_client(handler)
     response = client.post("/v1/tts/stream", json={"text": "Xin chào"})
 
-    assert response.status_code == 200 and response.headers["X-Sample-Rate"] == "24000"
-    lead, trail = int(24_000 * LEADING_PAD_SEC) * 2, int(24_000 * TRAILING_PAD_SEC) * 2
+    assert response.status_code == 200 and response.headers["X-Sample-Rate"] == "48000"
+    lead, trail = int(48_000 * LEADING_PAD_SEC) * 2, int(48_000 * TRAILING_PAD_SEC) * 2
     assert response.content[lead:len(response.content) - trail] == pcm
-    assert response.headers["X-Voice"] == "Leda"
+    assert response.headers["X-Voice"] == "cgSgspJ2msm6clMCkdW9"
 
 
-def test_gemini_tts_errors_surface_before_streaming():
-    client = make_gemini_client(lambda request: httpx.Response(400, json={"error": {"message": "bad voice"}}))
+def test_elevenlabs_tts_errors_surface_before_streaming():
+    client = make_elevenlabs_client(lambda request: httpx.Response(400, json={"detail": {"message": "bad voice"}}))
     response = client.post("/v1/tts/stream", json={"text": "Xin chào", "voice": "Nope"})
     assert response.status_code == 400 and "bad voice" in response.json()["detail"]
     assert client.post("/v1/tts", json={"text": "Xin chào"}).status_code == 400
 
 
-def test_gemini_tts_health_and_voices():
-    client = make_gemini_client(lambda request: httpx.Response(200))
+def test_elevenlabs_tts_health_and_voices():
+    def handler(request: httpx.Request):
+        if "voices" in str(request.url):
+            return httpx.Response(200, json={"voices": [{"voice_id": "v1", "name": "Jessica"}]})
+        return httpx.Response(200)
+
+    client = make_elevenlabs_client(handler)
     tts = client.get("/health").json()["tts"]
-    assert tts["provider"] == "gemini" and tts["model"] == "gemini-3.8-flash-lite-tts" and tts["state"] == "ready"
+    assert tts["provider"] == "elevenlabs" and tts["model"] == "eleven_v4_turbo" and tts["state"] == "ready"
     voices = client.get("/v1/tts/voices").json()
-    assert voices["default"] == "Leda" and {"id": "Puck", "label": "Puck"} in voices["voices"]
+    assert voices["default"] == "cgSgspJ2msm6clMCkdW9"
+    assert {"id": "v1", "label": "Jessica"} in voices["voices"]
 
 
 @pytest.mark.parametrize("backend,cuda,expected", [
     ("auto", True, VieneuSynthesizer),
-    ("auto", False, GeminiSynthesizer),
+    ("auto", False, ElevenLabsSynthesizer),
     ("vieneu", False, VieneuSynthesizer),
-    ("gemini", True, GeminiSynthesizer),
+    ("elevenlabs", True, ElevenLabsSynthesizer),
 ])
 def test_backend_selection(monkeypatch, backend, cuda, expected):
     import app.tts as tts
 
     monkeypatch.setattr(tts, "resolve_device", lambda setting: "cuda" if cuda or setting == "cuda" else "cpu")
-    synthesizer = create_synthesizer(Settings(_env_file=None, gemini_api_key="k", tts_backend=backend,
+    synthesizer = create_synthesizer(Settings(_env_file=None, elevenlabs_api_key="k", tts_backend=backend,
                                               tts_device="cpu" if backend == "vieneu" else "auto"))
     assert type(synthesizer) is expected
     if backend == "auto" and cuda:

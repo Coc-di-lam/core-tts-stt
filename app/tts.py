@@ -1,12 +1,7 @@
-"""Text-to-speech: local VieNeu or Gemini TTS (cloud).
+"""Text-to-speech: local VieNeu or ElevenLabs v4 Turbo (cloud).
 
-`TTS_BACKEND=auto` runs VieNeu when PyTorch sees an NVIDIA GPU (best-quality settings) and Gemini
-TTS otherwise; "vieneu" / "gemini" force one. Both backends expose the same interface.
-
-VieNeu device "auto" picks CUDA when PyTorch sees a GPU (PyTorch backend, batching/stream scheduler as
-before) and otherwise ONNX Runtime on CPU, where int8 graphs are ~1.5x faster than fp32 with the
-same intelligibility on a VNNI-capable CPU. `stream()` yields audio while it is generated, so
-the first sound is ready in ~0.2 s on CPU instead of after the whole sentence.
+`TTS_BACKEND=auto` runs VieNeu when PyTorch sees an NVIDIA GPU (best-quality settings) and
+ElevenLabs v4 Turbo otherwise; "vieneu" / "elevenlabs" force one. Both backends expose the same interface.
 """
 from __future__ import annotations
 
@@ -33,13 +28,6 @@ LEADING_PAD_SEC = 0.15
 TRAILING_PAD_SEC = 0.08
 _CACHE_ENTRIES = 128
 _MODES = {"vieneu-v3-turbo": "v3turbo", "vieneu-v3-nano": "v3nano"}
-GEMINI_SAMPLE_RATE = 24_000
-GEMINI_VOICES = [
-    "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe", "Autonoe",
-    "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi",
-    "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
-    "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
-]
 
 
 class TtsError(Exception):
@@ -65,29 +53,30 @@ def resolve_device(setting: str) -> str:
         import torch
 
         return "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:  # torch not installed: CPU-only install
+    except Exception:
         return "cpu"
 
 
 def resolve_backend(settings: Settings) -> str:
     backend = settings.tts_backend.strip().lower()
-    if backend in ("vieneu", "gemini"):
+    if backend in ("vieneu", "elevenlabs"):
         return backend
+    if backend == "gemini":
+        return "elevenlabs"
     if backend != "auto":
-        raise ValueError(f"TTS_BACKEND phải là auto | vieneu | gemini, không phải {settings.tts_backend!r}")
+        raise ValueError(f"TTS_BACKEND phải là auto | vieneu | elevenlabs, không phải {settings.tts_backend!r}")
     if resolve_device("auto") == "cuda":
         return "vieneu"
     if shutil.which("nvidia-smi"):
         logger.warning("NVIDIA GPU found but PyTorch CUDA is not installed (`uv sync --extra cuda`); "
-                       "using Gemini TTS")
-    return "gemini"
+                       "using ElevenLabs TTS")
+    return "elevenlabs"
 
 
-def create_synthesizer(settings: Settings) -> "VieneuSynthesizer | GeminiSynthesizer":
-    if resolve_backend(settings) == "gemini":
-        return GeminiSynthesizer(settings)
+def create_synthesizer(settings: Settings) -> "VieneuSynthesizer | ElevenLabsSynthesizer":
+    if resolve_backend(settings) in ("elevenlabs", "gemini"):
+        return ElevenLabsSynthesizer(settings)
     if settings.tts_backend.strip().lower() == "auto":
-        # Picked because a GPU is present: run it there, whatever TTS_DEVICE says.
         settings = settings.model_copy(update={"tts_device": "cuda"})
     return VieneuSynthesizer(settings)
 
@@ -124,26 +113,181 @@ class _CachedSynthesizer:
             self._cache.popitem(last=False)
 
 
+class ElevenLabsSynthesizer(_CachedSynthesizer):
+    """ElevenLabs TTS over REST & Streaming API (supports Eleven v4 Turbo)."""
+
+    provider = "elevenlabs"
+    device = "cloud"
+    backend = "elevenlabs"
+
+    def __init__(self, settings: Settings, client: httpx.Client | None = None):
+        super().__init__(settings)
+        self.model_name = settings.elevenlabs_tts_model
+        self.sample_rate = settings.elevenlabs_tts_sample_rate
+        self.output_format = settings.elevenlabs_tts_output_format
+        self.client = client or httpx.Client(timeout=settings.elevenlabs_tts_timeout_sec)
+        self.default_voice = settings.elevenlabs_tts_voice
+        configured = bool(settings.elevenlabs_api_key)
+        self.state = "ready" if configured else "error"
+        self.error = None if configured else "Chưa cấu hình ELEVENLABS_API_KEY."
+        self._cached_voices: list[dict[str, str]] | None = None
+
+    def load(self) -> None:
+        if self.error:
+            raise TtsError(503, self.error)
+
+    def voices(self) -> list[dict[str, str]]:
+        if self._cached_voices is not None:
+            return self._cached_voices
+        if not self.settings.elevenlabs_api_key:
+            return [{"id": self.default_voice, "label": "Nhu - Calm and Confident (Default)"}]
+
+        url = f"{self.settings.elevenlabs_api_url.rstrip('/')}/v1/voices"
+        try:
+            resp = self.client.get(url, headers=self._headers())
+            if resp.status_code == 200:
+                data = resp.json().get("voices", [])
+                voices_list = [
+                    {"id": v["voice_id"], "label": f"{v.get('name', v['voice_id'])}"}
+                    for v in data
+                ]
+                # Ensure default_voice is at the top of the list
+                def_item = next((v for v in voices_list if v["id"] == self.default_voice), None)
+                if def_item:
+                    voices_list.remove(def_item)
+                    if "(Default)" not in def_item["label"]:
+                        def_item["label"] = f"{def_item['label']} (Default)"
+                    voices_list.insert(0, def_item)
+                else:
+                    voices_list.insert(0, {"id": self.default_voice, "label": "Nhu - Calm and Confident (Default)"})
+                self._cached_voices = voices_list
+                return self._cached_voices
+        except Exception as exc:
+            logger.warning("Fetching ElevenLabs voices failed: %s", exc)
+
+        return [{"id": self.default_voice, "label": "Nhu - Calm and Confident (Default)"}]
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "xi-api-key": self.settings.elevenlabs_api_key,
+            "Content-Type": "application/json",
+        }
+
+    def synthesize(self, text: str, voice: str | None = None) -> Speech:
+        text, voice, key = self._prepare(text, voice)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return Speech(cached, _wav_duration(cached), voice, 0.0, True)
+        self.load()
+
+        url = f"{self.settings.elevenlabs_api_url.rstrip('/')}/v1/text-to-speech/{voice}?output_format={self.output_format}"
+        body = {
+            "text": text,
+            "model_id": self.model_name,
+        }
+
+        started = time.perf_counter()
+        try:
+            response = self.client.post(url, json=body, headers=self._headers())
+        except httpx.TimeoutException as exc:
+            raise TtsError(504, "ElevenLabs TTS quá thời gian chờ.") from exc
+        except httpx.HTTPError as exc:
+            raise TtsError(502, f"Không gọi được ElevenLabs TTS: {type(exc).__name__}") from exc
+
+        if response.status_code != 200:
+            raise TtsError(502 if response.status_code >= 500 else response.status_code,
+                           f"ElevenLabs TTS lỗi {response.status_code}: {_elevenlabs_error_message(response.text)}")
+
+        waveform = _pcm_to_float32(response.content)
+        if waveform.size == 0:
+            raise TtsError(502, "ElevenLabs TTS trả audio rỗng.")
+        wav = _encode_wav(waveform, self.sample_rate)
+        self._cache_put(key, wav)
+        return Speech(
+            wav,
+            round(waveform.size / self.sample_rate, 3),
+            voice,
+            round((time.perf_counter() - started) * 1000, 1),
+            False,
+        )
+
+    def stream(self, text: str, voice: str | None = None, cancel: threading.Event | None = None) -> Iterator[bytes]:
+        import numpy as np
+
+        text, voice, key = self._prepare(text, voice)
+        cached = self._cache_get(key)
+        if cached is not None:
+            yield _wav_pcm(cached)
+            return
+        self.load()
+
+        rate = self.sample_rate
+        url = f"{self.settings.elevenlabs_api_url.rstrip('/')}/v1/text-to-speech/{voice}/stream?output_format={self.output_format}"
+        body = {
+            "text": text,
+            "model_id": self.model_name,
+        }
+
+        parts: list[bytes] = []
+        try:
+            with self.client.stream("POST", url, json=body, headers=self._headers()) as response:
+                if response.status_code != 200:
+                    err_text = response.read().decode("utf-8", "replace")
+                    raise TtsError(
+                        502 if response.status_code >= 500 else response.status_code,
+                        f"ElevenLabs TTS stream lỗi {response.status_code}: {_elevenlabs_error_message(err_text)}",
+                    )
+                # Output leading silence padding
+                yield _to_pcm16(np.zeros(int(rate * LEADING_PAD_SEC), dtype=np.float32))
+
+                odd = b""
+                for chunk in response.iter_bytes(chunk_size=4096):
+                    if cancel is not None and cancel.is_set():
+                        return
+                    if not chunk:
+                        continue
+                    pcm = odd + chunk
+                    cut = len(pcm) - len(pcm) % 2
+                    pcm, odd = pcm[:cut], pcm[cut:]
+                    if pcm:
+                        parts.append(pcm)
+                        yield pcm
+
+        except httpx.TimeoutException as exc:
+            raise TtsError(504, "ElevenLabs TTS quá thời gian chờ.") from exc
+        except httpx.HTTPError as exc:
+            raise TtsError(502, f"Không gọi được ElevenLabs TTS: {type(exc).__name__}") from exc
+
+        # Output trailing silence padding
+        yield _to_pcm16(np.zeros(int(rate * TRAILING_PAD_SEC), dtype=np.float32))
+        if parts:
+            full_pcm = b"".join(parts)
+            self._cache_put(key, _encode_wav(_pcm_to_float32(full_pcm), rate))
+
+
+# Backward-compatible alias
+GeminiSynthesizer = ElevenLabsSynthesizer
+
+
 class VieneuSynthesizer(_CachedSynthesizer):
     provider = "vieneu"
 
-    def __init__(self, settings: Settings, model: Any = None, fallback: GeminiSynthesizer | None = None):
+    def __init__(self, settings: Settings, model: Any = None, fallback: ElevenLabsSynthesizer | None = None):
         super().__init__(settings)
         self.model_name = settings.tts_model
         self._model = model
         self._load_lock = threading.Lock()
         self._infer_lock = threading.Lock()
-        self.state = "ready" if model is not None else "idle"  # idle | loading | ready | error
+        self.state = "ready" if model is not None else "idle"
         self.error: str | None = None
         self.device = resolve_device(settings.tts_device) if model is None else "cpu"
         self.backend = getattr(model, "backend", None)
         self.default_voice = settings.tts_voice
         self._fallback = fallback
         is_auto = settings.tts_backend.strip().lower() == "auto"
-        if self._fallback is None and is_auto and settings.tts_fallback_gemini and settings.gemini_api_key:
-            self._fallback = GeminiSynthesizer(settings)
+        if self._fallback is None and is_auto and settings.tts_fallback_online and settings.elevenlabs_api_key:
+            self._fallback = ElevenLabsSynthesizer(settings)
 
-    # ---- model ----
     def load(self) -> Any:
         if self._model is not None:
             return self._model
@@ -158,14 +302,14 @@ class VieneuSynthesizer(_CachedSynthesizer):
                     self._model = self._create(mode)
                     self.backend = getattr(self._model, "backend", "onnx")
                     self.default_voice = self._pick_default_voice(self._model)
-                    with self._infer_lock:  # warm-up: the first inference pays graph/session setup
+                    with self._infer_lock:
                         self._model.infer("Xin chào.", voice=self.default_voice)
                 except Exception as exc:
                     self._model = None
                     self.state, self.error = "error", f"{type(exc).__name__}: {exc}"
                     logger.exception("Loading VieNeu failed")
-                    if self.settings.tts_fallback_gemini and self._fallback:
-                        logger.warning("VieNeu TTS không khả dụng (%s), tự động kích hoạt dự phòng Gemini TTS", exc)
+                    if self.settings.tts_fallback_online and self._fallback:
+                        logger.warning("VieNeu TTS không khả dụng (%s), tự động kích hoạt dự phòng ElevenLabs TTS", exc)
                         return None
                     raise TtsError(503, f"VieNeu TTS không khả dụng: {type(exc).__name__}") from exc
                 self.state, self.error = "ready", None
@@ -177,7 +321,7 @@ class VieneuSynthesizer(_CachedSynthesizer):
         from vieneu import Vieneu
 
         settings = self.settings
-        if mode == "v3nano":  # ONNX/CPU only
+        if mode == "v3nano":
             self.device = "cpu"
             return Vieneu(mode="v3nano", threads=settings.tts_cpu_threads)
         if self.device == "cpu":
@@ -228,7 +372,6 @@ class VieneuSynthesizer(_CachedSynthesizer):
             "apply_watermark": self.settings.tts_apply_watermark,
         }
 
-    # ---- whole clip ----
     def synthesize(self, text: str, voice: str | None = None) -> Speech:
         text_prep, voice_prep, key = self._prepare(text, voice)
         started = time.perf_counter()
@@ -236,12 +379,12 @@ class VieneuSynthesizer(_CachedSynthesizer):
         if cached is not None:
             return Speech(cached, _wav_duration(cached), voice_prep, 0.0, True)
 
-        if self.state == "error" and self.settings.tts_fallback_gemini and self._fallback:
+        if self.state == "error" and self.settings.tts_fallback_online and self._fallback:
             return self._fallback.synthesize(text, voice)
 
         try:
             model = self.load()
-            if model is None and self.settings.tts_fallback_gemini and self._fallback:
+            if model is None and self.settings.tts_fallback_online and self._fallback:
                 return self._fallback.synthesize(text, voice)
             preset_voices = {voice_id for _, voice_id in model.list_preset_voices()} if model is not None else set()
             if preset_voices and voice_prep not in preset_voices:
@@ -258,21 +401,15 @@ class VieneuSynthesizer(_CachedSynthesizer):
         except Exception as exc:
             if isinstance(exc, TtsError) and exc.status_code < 500:
                 raise
-            if self.settings.tts_fallback_gemini and self._fallback:
-                logger.warning("VieNeu synthesize thất bại (%s), tự động chuyển sang Gemini TTS", exc)
+            if self.settings.tts_fallback_online and self._fallback:
+                logger.warning("VieNeu synthesize thất bại (%s), tự động chuyển sang ElevenLabs TTS", exc)
                 return self._fallback.synthesize(text, voice)
             if isinstance(exc, TtsError):
                 raise
             logger.exception("VieNeu synthesis failed")
             raise TtsError(503, f"VieNeu TTS lỗi: {type(exc).__name__}") from exc
 
-    # ---- streaming ----
     def stream(self, text: str, voice: str | None = None, cancel: threading.Event | None = None) -> Iterator[bytes]:
-        """Yield PCM 16-bit LE mono chunks at `sample_rate`, padded like `synthesize`.
-
-        Validation errors raise before the first chunk. Runs in a worker thread; set `cancel`
-        to stop generating once the client is gone.
-        """
         import numpy as np
 
         text_prep, voice_prep, key = self._prepare(text, voice)
@@ -281,14 +418,14 @@ class VieneuSynthesizer(_CachedSynthesizer):
             yield _wav_pcm(cached)
             return
 
-        if self.state == "error" and self.settings.tts_fallback_gemini and self._fallback:
-            logger.warning("VieNeu ở trạng thái lỗi, stream tự động chuyển sang Gemini TTS")
+        if self.state == "error" and self.settings.tts_fallback_online and self._fallback:
+            logger.warning("VieNeu ở trạng thái lỗi, stream tự động chuyển sang ElevenLabs TTS")
             yield from self._fallback.stream(text, voice, cancel)
             return
 
         try:
             model = self.load()
-            if model is None and self.settings.tts_fallback_gemini and self._fallback:
+            if model is None and self.settings.tts_fallback_online and self._fallback:
                 yield from self._fallback.stream(text, voice, cancel)
                 return
             preset_voices = {voice_id for _, voice_id in model.list_preset_voices()} if model is not None else set()
@@ -316,8 +453,8 @@ class VieneuSynthesizer(_CachedSynthesizer):
         except Exception as exc:
             if isinstance(exc, TtsError) and exc.status_code < 500:
                 raise
-            if self.settings.tts_fallback_gemini and self._fallback:
-                logger.warning("VieNeu stream thất bại (%s), tự động chuyển sang Gemini TTS", exc)
+            if self.settings.tts_fallback_online and self._fallback:
+                logger.warning("VieNeu stream thất bại (%s), tự động chuyển sang ElevenLabs TTS", exc)
                 yield from self._fallback.stream(text, voice, cancel)
                 return
             if isinstance(exc, TtsError):
@@ -325,155 +462,19 @@ class VieneuSynthesizer(_CachedSynthesizer):
             raise
 
 
-class GeminiSynthesizer(_CachedSynthesizer):
-    """Gemini TTS over the Interactions API: 24 kHz mono PCM, streamed as it is generated."""
-
-    provider = "gemini"
-    device = "cloud"
-    backend = "gemini"
-    sample_rate = GEMINI_SAMPLE_RATE
-
-    def __init__(self, settings: Settings, client: httpx.Client | None = None):
-        super().__init__(settings)
-        self.model_name = settings.gemini_tts_model
-        self.client = client or httpx.Client(timeout=settings.gemini_tts_timeout_sec)
-        self.default_voice = settings.gemini_tts_voice
-        configured = bool(settings.gemini_api_key)
-        self.state = "ready" if configured else "error"
-        self.error = None if configured else "Chưa cấu hình GEMINI_API_KEY."
-
-    def load(self) -> None:
-        if self.error:
-            raise TtsError(503, self.error)
-
-    def voices(self) -> list[dict[str, str]]:
-        return [{"id": voice, "label": voice} for voice in GEMINI_VOICES]
-
-    def _body(self, text: str, voice: str, stream: bool) -> dict:
-        part: dict = {"type": "text", "text": text}
-        if self.settings.gemini_tts_style:
-            part["annotations"] = [{"type": "speech_metadata", "style": self.settings.gemini_tts_style}]
-        body = {
-            "model": self.model_name,
-            "input": [{"type": "user_input", "content": [part]}],
-            "response_format": {"type": "audio", "mime_type": "audio/l16", "sample_rate": self.sample_rate},
-            "generation_config": {"speech_config": [{"voice": voice}]},
-        }
-        if stream:
-            body["stream"] = True
-        return body
-
-    def _headers(self) -> dict[str, str]:
-        return {"x-goog-api-key": self.settings.gemini_api_key}
-
-    # ---- whole clip ----
-    def synthesize(self, text: str, voice: str | None = None) -> Speech:
-        text, voice, key = self._prepare(text, voice)
-        cached = self._cache_get(key)
-        if cached is not None:
-            return Speech(cached, _wav_duration(cached), voice, 0.0, True)
-        self.load()
-
-        started = time.perf_counter()
-        try:
-            response = self.client.post(self.settings.gemini_api_url, json=self._body(text, voice, False),
-                                        headers=self._headers())
-        except httpx.TimeoutException as exc:
-            raise TtsError(504, "Gemini TTS quá thời gian chờ.") from exc
-        except httpx.HTTPError as exc:
-            raise TtsError(502, f"Không gọi được Gemini TTS: {type(exc).__name__}") from exc
-        if response.status_code != 200:
-            raise _gemini_status_error(response.status_code, _gemini_error_message(response.text))
-
-        audio = b"".join(
-            base64.b64decode(content["data"])
-            for step in response.json().get("steps") or []
-            for content in step.get("content") or []
-            if content.get("data")
-        )
-        waveform = _pcm_to_float32(audio)
-        if waveform.size == 0:
-            raise TtsError(502, "Gemini TTS trả audio rỗng.")
-        wav = _encode_wav(waveform, self.sample_rate)
-        self._cache_put(key, wav)
-        return Speech(wav, round(waveform.size / self.sample_rate, 3), voice,
-                      round((time.perf_counter() - started) * 1000, 1), False)
-
-    # ---- streaming ----
-    def stream(self, text: str, voice: str | None = None, cancel: threading.Event | None = None) -> Iterator[bytes]:
-        """Same contract as `VieneuSynthesizer.stream`; HTTP/API errors raise before the first chunk."""
-        import numpy as np
-
-        text, voice, key = self._prepare(text, voice)
-        cached = self._cache_get(key)
-        if cached is not None:
-            yield _wav_pcm(cached)
-            return
-        self.load()
-
-        rate = self.sample_rate
-        parts: list[bytes] = []
-        try:
-            with self.client.stream("POST", self.settings.gemini_api_url, json=self._body(text, voice, True),
-                                    headers=self._headers()) as response:
-                if response.status_code != 200:
-                    message = _gemini_error_message(response.read().decode("utf-8", "replace"))
-                    raise _gemini_status_error(response.status_code, message)
-                yield _to_pcm16(np.zeros(int(rate * LEADING_PAD_SEC), dtype=np.float32))
-                odd = b""  # a PCM16 sample can straddle two deltas
-                for line in response.iter_lines():
-                    if cancel is not None and cancel.is_set():
-                        return
-                    event = _sse_event(line)
-                    if event is None:
-                        continue
-                    if event.get("event_type") == "error":
-                        error = event.get("error") or {}
-                        raise TtsError(502, f"Gemini TTS lỗi: {error.get('message') or error}"[:300])
-                    delta = event.get("delta") or {}
-                    if event.get("event_type") != "step.delta" or delta.get("type") != "audio":
-                        continue
-                    pcm = odd + base64.b64decode(delta.get("data") or "")
-                    cut = len(pcm) - len(pcm) % 2
-                    pcm, odd = pcm[:cut], pcm[cut:]
-                    if pcm:
-                        parts.append(pcm)
-                        yield pcm
-        except httpx.TimeoutException as exc:
-            raise TtsError(504, "Gemini TTS quá thời gian chờ.") from exc
-        except httpx.HTTPError as exc:
-            raise TtsError(502, f"Không gọi được Gemini TTS: {type(exc).__name__}") from exc
-        yield _to_pcm16(np.zeros(int(rate * TRAILING_PAD_SEC), dtype=np.float32))
-        if parts:
-            self._cache_put(key, _encode_wav(_pcm_to_float32(b"".join(parts)), rate))
-
-
-def _sse_event(line: str) -> dict | None:
-    if not line.startswith("data:"):
-        return None
-    data = line[5:].strip()
-    if not data or data == "[DONE]":
-        return None
+def _elevenlabs_error_message(text: str) -> str:
     try:
-        return json.loads(data)
-    except ValueError:
-        return None
-
-
-def _gemini_status_error(status_code: int, message: str) -> TtsError:
-    return TtsError(502 if status_code >= 500 else status_code, f"Gemini TTS trả lỗi {status_code}: {message}")
-
-
-def _gemini_error_message(text: str) -> str:
-    try:
-        error = json.loads(text).get("error") or {}
-        return str(error.get("message") or error)[:300]
-    except (ValueError, AttributeError):
+        data = json.loads(text)
+        detail = data.get("detail") or data.get("error") or {}
+        if isinstance(detail, dict):
+            return str(detail.get("message") or detail)[:300]
+        return str(detail)[:300]
+    except Exception:
         return text[:300]
 
 
 def _pcm_to_float32(audio: bytes):
-    """Raw PCM16 LE -> float32; also accepts a WAV in case the API ignores the requested mime type."""
+    """Raw PCM16 LE -> float32; also accepts a WAV in case returned with header."""
     import numpy as np
     import soundfile as sf
 

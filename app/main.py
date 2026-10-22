@@ -1,4 +1,4 @@
-"""Speech service: STT (Gemini transcribe API) + TTS (local VieNeu or Gemini TTS), plus a small test page."""
+"""Speech service: STT (ElevenLabs Scribe v2) + TTS (local VieNeu or ElevenLabs v4 Turbo), plus a test page."""
 from __future__ import annotations
 
 import os
@@ -26,7 +26,7 @@ import hmac
 import logging
 import threading
 from contextlib import asynccontextmanager
-from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket
@@ -35,9 +35,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, Field
 
 from app.config import Settings, get_settings, split_csv
-from app.stt import GeminiTranscriber, ResilientTranscriber, SttError, create_transcriber, resolve_mime_type
-from app.stt_live import Connector, connect_gemini_live, relay_stream
-from app.tts import GeminiSynthesizer, TtsError, VieneuSynthesizer, create_synthesizer
+from app.stt import ElevenLabsTranscriber, GeminiTranscriber, ResilientTranscriber, SttError, create_transcriber, resolve_mime_type
+from app.stt_live import Connector, connect_elevenlabs_live, connect_gemini_live, relay_stream
+from app.tts import ElevenLabsSynthesizer, GeminiSynthesizer, TtsError, VieneuSynthesizer, create_synthesizer
 
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -56,17 +56,18 @@ class SttResponse(BaseModel):
     latency_ms: float
 
 
-def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber | ResilientTranscriber | None = None,
-               synthesizer: VieneuSynthesizer | GeminiSynthesizer | None = None, live_connector: Connector | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None,
+               transcriber: ElevenLabsTranscriber | GeminiTranscriber | ResilientTranscriber | None = None,
+               synthesizer: VieneuSynthesizer | ElevenLabsSynthesizer | GeminiSynthesizer | None = None,
+               live_connector: Connector | None = None) -> FastAPI:
     settings = settings or get_settings()
     transcriber = transcriber or create_transcriber(settings)
     synthesizer = synthesizer or create_synthesizer(settings)
-    live_connector = live_connector or connect_gemini_live
+    live_connector = live_connector or connect_elevenlabs_live
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         if settings.tts_preload and synthesizer.state == "idle":
-            # Load in the background so /health answers while the model warms up.
             threading.Thread(target=_preload, args=(synthesizer,), daemon=True).start()
         if getattr(settings, "gipformer_preload", True) and hasattr(transcriber, "gipformer") and transcriber.gipformer:
             threading.Thread(target=_preload_stt, args=(transcriber.gipformer,), daemon=True).start()
@@ -77,7 +78,7 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
     app.add_middleware(CORSMiddleware, allow_origins=split_csv(settings.cors_origins) or ["*"],
                        allow_methods=["*"], allow_headers=["*"],
                        expose_headers=["X-Audio-Duration", "X-Latency-Ms", "X-Voice", "X-Cache-Hit",
-                                      "X-Sample-Rate", "X-Channels", "X-Sample-Format"])
+                                       "X-Sample-Rate", "X-Channels", "X-Sample-Format"])
 
     def require_token(authorization: str | None = Header(default=None)) -> None:
         if not settings.service_token:
@@ -97,7 +98,7 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
 
     @app.get("/health")
     async def health():
-        stt_provider = getattr(transcriber, "active_provider", "gemini")
+        stt_provider = getattr(transcriber, "active_provider", "elevenlabs")
         stt_model = getattr(transcriber, "active_model", settings.stt_model)
         stt_live_model = (
             "gipformer-live"
@@ -119,7 +120,7 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
     @app.post("/v1/stt", response_model=SttResponse, dependencies=[Depends(require_token)])
     async def speech_to_text(file: UploadFile = File(...), language: str | None = Form(default=None),
                              mode: str | None = Form(default=None), vocabulary: str | None = Form(default=None)):
-        """Transcribe one utterance. `language`: comma-separated BCP-47 codes, "auto" to detect."""
+        """Transcribe one utterance using ElevenLabs Scribe v2 (or local Gipformer)."""
         mime_type = resolve_mime_type(file.content_type, file.filename)
         audio = await file.read(settings.stt_max_bytes + 1)
         languages = None if language is None else ([] if language.strip().lower() == "auto" else split_csv(language))
@@ -129,7 +130,7 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
 
     @app.websocket("/v1/stt/stream")
     async def speech_to_text_stream(websocket: WebSocket):
-        """Live transcription; protocol in app/stt_live.py. The token goes in the "start" message."""
+        """Live transcription using ElevenLabs Scribe v2 Realtime (or local Gipformer)."""
         await relay_stream(websocket, settings, live_connector)
 
     @app.post("/v1/tts", dependencies=[Depends(require_token)],
@@ -149,7 +150,7 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
         cancel = threading.Event()
         voice = request.voice or synthesizer.default_voice
         chunks = _iterate_in_thread(lambda: synthesizer.stream(request.text, request.voice, cancel))
-        first = await anext(chunks)  # validation/load errors surface here as HTTP errors
+        first = await anext(chunks)
 
         async def body():
             try:
@@ -173,7 +174,6 @@ def create_app(settings: Settings | None = None, transcriber: GeminiTranscriber 
 
 
 async def _iterate_in_thread(make_iterator):
-    """Drive a blocking iterator in a worker thread and yield its items asynchronously."""
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
     done = object()
@@ -194,11 +194,11 @@ async def _iterate_in_thread(make_iterator):
         yield item
 
 
-def _preload(synthesizer: VieneuSynthesizer | GeminiSynthesizer) -> None:
+def _preload(synthesizer: VieneuSynthesizer | ElevenLabsSynthesizer) -> None:
     try:
         synthesizer.load()
     except TtsError:
-        pass  # state/error are recorded on the synthesizer and surfaced by /health
+        pass
 
 
 def _preload_stt(gipformer: Any) -> None:

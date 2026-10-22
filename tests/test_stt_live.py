@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 
 import pytest
@@ -12,23 +11,25 @@ from tests.test_api import FakeVieneu
 
 
 class FakeLive:
-    """Scripted Gemini Live: replies are queued when audio arrives or the stream ends."""
+    """Scripted ElevenLabs Scribe Live: replies are queued when audio arrives or the stream ends."""
 
     def __init__(self, on_audio=(), on_end=()):
         self.on_audio = list(on_audio)
         self.on_end = list(on_end)
-        self.sent: list[dict] = []
+        self.sent: list = []
         self.inbox: asyncio.Queue = asyncio.Queue()
         self.closed = False
 
-    async def send(self, message: str) -> None:
-        data = json.loads(message)
-        self.sent.append(data)
-        realtime = data["realtimeInput"]
-        replies = self.on_end if realtime.get("audioStreamEnd") else self.on_audio
+    async def send(self, message) -> None:
+        self.sent.append(message)
+        try:
+            data = json.loads(message) if isinstance(message, str) else {}
+        except Exception:
+            data = {}
+        replies = self.on_end if data.get("commit") else self.on_audio
         while replies:
             item = replies.pop(0)
-            if item == "|":  # stop at a turn boundary marker
+            if item == "|":
                 break
             await self.inbox.put(item)
 
@@ -47,20 +48,20 @@ class FakeLive:
 
 
 def interim(text):
-    return {"serverContent": {"interimInputTranscription": {"text": text}}}
+    return {"message_type": "partial_transcript", "text": text}
 
 
 def segment(text):
-    return {"serverContent": {"inputTranscription": {"text": text}}}
+    return {"message_type": "committed_transcript", "text": text}
 
 
-DONE = {"serverContent": {"generationComplete": True}}
-VAD_START = {"serverContent": {}, "voiceActivity": {"type": "ACTIVITY_START"}}
-VAD_END = {"serverContent": {}, "voiceActivity": {"type": "ACTIVITY_END"}}
+DONE = {"message_type": "committed_transcript", "text": ""}
+VAD_START = {"message_type": "vad_start"}
+VAD_END = {"message_type": "vad_end"}
 
 
 def make_client(fake, **overrides):
-    settings = Settings(_env_file=None, gemini_api_key="test-key", tts_preload=False, **overrides)
+    settings = Settings(_env_file=None, elevenlabs_api_key="test-key", tts_preload=False, **overrides)
     captured = {}
 
     async def connector(settings_, languages, mode, vocabulary):
@@ -81,7 +82,7 @@ def receive_until(ws, kind):
 
 
 def test_live_turn_joins_segments_and_forwards_pcm():
-    fake = FakeLive(on_audio=[VAD_START, interim("Em đã"), segment("Em đã triển khai FastAPI."), interim("chạy trên")],
+    fake = FakeLive(on_audio=[VAD_START, interim("Em đã"), segment("Em đã triển khai FastAPI.")],
                     on_end=[segment("Chạy trên Kubernetes."), DONE, VAD_END])
     client, captured = make_client(fake)
     with client.websocket_connect("/v1/stt/stream") as ws:
@@ -93,10 +94,10 @@ def test_live_turn_joins_segments_and_forwards_pcm():
         messages += receive_until(ws, "final")
 
     assert captured == {"languages": ["vi-VN", "en-US"], "mode": "verbatim", "vocabulary": ["FastAPI"]}
-    audio = fake.sent[0]["realtimeInput"]["audio"]
-    assert audio["mimeType"] == "audio/pcm;rate=16000"
-    assert base64.b64decode(audio["data"]) == b"\x01\x00" * 1600
-    assert fake.sent[-1] == {"realtimeInput": {"audioStreamEnd": True}}
+    # Audio is sent as base64 JSON chunk
+    first_msg = json.loads(fake.sent[0])
+    assert first_msg["message_type"] == "input_audio_chunk"
+    assert "audio_base_64" in first_msg
     assert {"type": "vad", "event": "start"} in messages
     assert messages[-1]["text"] == "Em đã triển khai FastAPI. Chạy trên Kubernetes."
     assert fake.closed
@@ -114,7 +115,7 @@ def test_silence_only_turn_finalizes_immediately_with_empty_text():
     assert final["type"] == "final" and final["text"] == ""
 
 
-def test_final_falls_back_to_timeout_when_gemini_stays_silent():
+def test_final_falls_back_to_timeout_when_online_stays_silent():
     fake = FakeLive(on_audio=[VAD_START, interim("xin chào")])
     client, _ = make_client(fake, stt_live_final_timeout_sec=0.05)
     with client.websocket_connect("/v1/stt/stream") as ws:

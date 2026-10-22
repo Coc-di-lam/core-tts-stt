@@ -77,16 +77,28 @@
         </select>
       </label>
       <label>Chế độ STT
-        <select id="mode"><option value="smart">smart</option><option value="verbatim">verbatim</option></select>
+        <select id="mode">
+          <option value="smart">smart (lọc từ đệm, văn bản sạch)</option>
+          <option value="verbatim">verbatim (nguyên văn từng từ, giữ ừm/ờ)</option>
+        </select>
       </label>
       <label style="flex:1;min-width:180px">Từ vựng riêng (phân tách bằng dấu phẩy)
         <input id="vocabulary" placeholder="Kubernetes, FastAPI, Redis">
       </label>
       <label>Service token <input id="token" type="password" placeholder="nếu có" autocomplete="off"></label>
-      <label class="check"><input type="checkbox" id="autoStop"> Tự dừng khi Gemini thấy hết nói</label>
+      <label class="check" title="Tự động lọc tiếng ồn nền (lưu ý: nếu nói nhỏ hoặc mic yếu có thể bị nuốt chữ)"><input type="checkbox" id="noiseSuppression"> Chống ồn micro (Noise suppression)</label>
+      <label class="check" title="Tự động bù/tăng âm lượng micro nếu bạn nói nhỏ hoặc mic ở xa"><input type="checkbox" id="autoGainControl" checked> Tự tăng âm mic (AGC)</label>
+      <label class="check"><input type="checkbox" id="autoStop"> Tự dừng khi phát hiện hết nói (VAD)</label>
       <label class="check"><input type="checkbox" id="ttsStream" checked> TTS streaming</label>
     </div>
     <button class="rec-btn primary" id="recBtn">🎙 Bấm để nói</button>
+    <div style="display:flex;align-items:center;gap:10px;margin:-4px 0 14px 0;">
+      <span class="muted" style="font-size:12px;white-space:nowrap;">Mức mic:</span>
+      <div style="flex:1;height:8px;background:var(--code);border-radius:4px;overflow:hidden;border:1px solid var(--line);">
+        <div id="micMeter" style="height:100%;width:0%;background:var(--ok);transition:width 0.05s ease;"></div>
+      </div>
+      <span id="micDb" class="muted" style="font-size:11px;min-width:40px;text-align:right;">0%</span>
+    </div>
     <div class="steps">
       <div class="step" id="s-rec"><div class="k">Thu âm <span id="vadDot" class="vad"></span></div><div class="v">–</div></div>
       <div class="step" id="s-stt"><div class="k">STT (dừng → final)</div><div class="v">–</div></div>
@@ -134,7 +146,7 @@ const store = {
   get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch {} },
 };
-for (const id of ["token", "language", "mode", "vocabulary", "autoStop", "ttsStream"]) {
+for (const id of ["token", "language", "mode", "vocabulary", "autoStop", "ttsStream", "noiseSuppression", "autoGainControl"]) {
   if ($(id).type === "checkbox") {
     const saved = store.get("speech." + id);
     if (saved) $(id).checked = saved === "1";
@@ -172,7 +184,7 @@ async function stt(blob, filename) {
   const ms = performance.now() - t0;
   if (!res.ok) { const msg = await errorText(res); log(`STT ${res.status} ${msg}`, true); throw new Error(msg); }
   const data = await res.json();
-  log(`STT 200 ${(blob.size / 1024).toFixed(0)} KB → "${data.text.slice(0, 60)}" (client ${ms.toFixed(0)} ms, Gemini ${data.latency_ms} ms)`);
+  log(`STT 200 ${(blob.size / 1024).toFixed(0)} KB → "${data.text.slice(0, 60)}" (client ${ms.toFixed(0)} ms, STT ${data.latency_ms} ms)`);
   return { ...data, clientMs: ms };
 }
 
@@ -243,15 +255,24 @@ async function startLive() {
   setTranscript("");
   $("liveInfo").textContent = "";
   let stream;
+  const ns = $("noiseSuppression").checked;
+  const agc = $("autoGainControl").checked;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: ns,
+        autoGainControl: agc,
+        channelCount: 1,
+      }
+    });
   } catch (e) { log("Không mở được micro: " + e.message, true); resetButton(); return; }
 
   const t0 = performance.now();
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/v1/stt/stream`);
   ws.binaryType = "arraybuffer";
   // Capture starts now; frames recorded before "ready" are buffered and flushed then,
-  // so words spoken right after the click are not lost while Gemini sets up (~0.6 s).
+  // so words spoken right after the click are not lost while backend sets up (~0.6 s).
   live = { ws, stream, frames: [], sent: 0, ready: false, stoppedAt: null, finished: false };
   ws.onopen = () => ws.send(JSON.stringify({
     type: "start", language: $("language").value, mode: $("mode").value,
@@ -270,7 +291,7 @@ async function onLiveMessage(msg, t0) {
   if (!live) return;
   if (msg.type === "ready") {
     $("liveInfo").textContent = `· ${msg.model} · kết nối ${fmt(performance.now() - t0)}`;
-    log(`WS ready ${msg.model} (Gemini setup ${msg.setup_ms} ms, gửi bù ${live.frames.length * 100} ms audio đã thu)`);
+    log(`WS ready ${msg.model} (setup ${msg.setup_ms} ms, gửi bù ${live.frames.length * 100} ms audio đã thu)`);
     live.ready = true;
     flushFrames();
     if (live.stoppedAt) live.ws.send(JSON.stringify({ type: "end" }));
@@ -305,9 +326,26 @@ async function startCapture() {
     live.frames.push(new Int16Array(e.data));
     if (live.ready) flushFrames();
   };
-  ctx.createMediaStreamSource(live.stream).connect(node);
+  const source = ctx.createMediaStreamSource(live.stream);
+  source.connect(node);
+
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 256;
+  const pcmData = new Uint8Array(analyser.frequencyBinCount);
+  source.connect(analyser);
+
   live.startedAt = performance.now();
-  live.timer = setInterval(() => setStep("s-rec", fmt(performance.now() - live.startedAt), true), 100);
+  live.timer = setInterval(() => {
+    setStep("s-rec", fmt(performance.now() - live.startedAt), true);
+    analyser.getByteFrequencyData(pcmData);
+    let sum = 0;
+    for (let i = 0; i < pcmData.length; i++) sum += pcmData[i];
+    const avg = sum / pcmData.length;
+    const pct = Math.min(100, Math.round((avg / 128) * 100));
+    $("micMeter").style.width = pct + "%";
+    $("micMeter").style.background = pct > 75 ? "var(--warn)" : (pct > 5 ? "var(--ok)" : "var(--line)");
+    $("micDb").textContent = pct + "%";
+  }, 100);
   $("recBtn").disabled = false;
   $("recBtn").classList.add("recording");
   $("recBtn").textContent = "■ Đang nghe… bấm để dừng";
@@ -334,6 +372,8 @@ function teardown() {
   live.ctx?.close().catch(() => {});
   if (live.ws.readyState <= WebSocket.OPEN) live.ws.close();
   $("vadDot").classList.remove("on");
+  $("micMeter").style.width = "0%";
+  $("micDb").textContent = "0%";
   live = null;
 }
 
@@ -456,9 +496,11 @@ async function loadVoices() {
   const data = await res.json();
   const saved = store.get("speech.voice");
   $("voice").innerHTML = "";
+  const hasSaved = saved && saved !== "cgSgspJ2msm6clMCkdW9" && data.voices.some((x) => x.id === saved);
+  const selectedVoice = hasSaved ? saved : data.default;
   for (const v of data.voices) {
     const opt = new Option(v.label, v.id);
-    opt.selected = v.id === (data.voices.some((x) => x.id === saved) ? saved : data.default);
+    opt.selected = v.id === selectedVoice;
     $("voice").append(opt);
   }
 }
@@ -468,9 +510,15 @@ let voicesLoaded = false;
 async function refreshHealth() {
   try {
     const h = await (await fetch("/health")).json();
+    const sttMissing = h.stt.provider === "elevenlabs" ? " (thiếu ELEVENLABS_API_KEY)" : " (thiếu API_KEY)";
+    const ttsTitle = h.tts.provider === "elevenlabs"
+      ? `TTS · ElevenLabs (${h.tts.model})`
+      : (h.tts.provider === "gemini"
+          ? `TTS · Gemini ${h.tts.model}`
+          : `TTS · VieNeu ${h.tts.device}${h.tts.device === "cpu" ? " " + h.tts.cpu_precision : ""}`);
     const pills = [
-      [`STT · ${h.stt.live_model} / ${h.stt.model}`, h.stt.configured ? "ok" : "err", h.stt.configured ? "" : " (thiếu GEMINI_API_KEY)"],
-      [h.tts.provider === "gemini" ? `TTS · Gemini ${h.tts.model}` : `TTS · VieNeu ${h.tts.device}${h.tts.device === "cpu" ? " " + h.tts.cpu_precision : ""}`, { ready: "ok", loading: "warn", idle: "warn", error: "err" }[h.tts.state], ` (${h.tts.state})`],
+      [`STT · ${h.stt.live_model} / ${h.stt.model}`, h.stt.configured ? "ok" : "err", h.stt.configured ? "" : sttMissing],
+      [ttsTitle, { ready: "ok", loading: "warn", idle: "warn", error: "err" }[h.tts.state] || "warn", ` (${h.tts.state})`],
     ];
     if (h.auth_required) pills.push(["Cần service token", "warn", ""]);
     $("pills").innerHTML = "";

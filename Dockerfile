@@ -8,7 +8,20 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/venv \
 
 WORKDIR /srv
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project --extra cuda
+
+# Build argument to control CUDA:
+# Default WITH_CUDA=false -> Lightweight image without CUDA runtime (~1.5 GB)
+# To build with CUDA: docker build --build-arg WITH_CUDA=true .
+ARG WITH_CUDA=false
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$WITH_CUDA" = "true" ] || [ "$WITH_CUDA" = "1" ]; then \
+        echo ">>> Building WITH NVIDIA CUDA runtime (large GPU image)..."; \
+        uv sync --locked --no-dev --no-install-project --extra cuda; \
+    else \
+        echo ">>> Building WITHOUT CUDA (lightweight CPU/cloud image ~1.5GB)..."; \
+        uv sync --locked --no-dev --no-install-project; \
+    fi
+
 COPY app ./app
 
 EXPOSE 8000

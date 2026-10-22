@@ -1,6 +1,9 @@
 services:
   speech:
-    build: .
+    build:
+      context: .
+      args:
+        WITH_CUDA: ${BUILD_WITH_CUDA:-false}
     ports:
       - "127.0.0.1:8010:8000"
     env_file: .env
