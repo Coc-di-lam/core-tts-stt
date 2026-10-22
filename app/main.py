@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 # On Windows, ensure sherpa-onnx's bundled onnxruntime DLL takes precedence over System32
 if sys.platform == "win32":
