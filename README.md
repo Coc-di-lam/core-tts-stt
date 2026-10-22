@@ -14,7 +14,6 @@ trước và sau core.
 Browser (mic, PCM 16 kHz) ──WS /v1/stt/stream──▶ interim… final ──▶ Browser/Gateway ──candidate_answer──▶ core (WS)
 core ──response_token──▶ Gateway (cắt theo câu) ──▶ POST /v1/tts/stream ──PCM từng đoạn──▶ Browser
 ```
-
 ## Chạy local
 
 ```powershell
