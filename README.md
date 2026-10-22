@@ -188,3 +188,6 @@ Xem `.env.example`. Các biến chính: `ELEVENLABS_API_KEY`, `STT_LIVE_MODEL`, 
 `TTS_BACKEND` (`auto` | `vieneu` | `gemini`), `GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE`, `GEMINI_TTS_STYLE`,
 `TTS_MODEL`, `TTS_VOICE`, `TTS_DEVICE` (`auto` | `cpu` | `cuda`), `TTS_CPU_PRECISION`, `TTS_CPU_THREADS`, `TTS_GPU_DTYPE`, `TTS_PRELOAD`,
 `SERVICE_TOKEN`, `CORS_ORIGINS`.
+
+
+hachimi
