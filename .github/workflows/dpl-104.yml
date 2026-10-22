@@ -1,0 +1,19 @@
+name: DPL - build stack and deploy CT 104
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stack:
+    name: Build all images and deploy default branch
+    runs-on: [self-hosted, linux, dpl-104]
+    timeout-minutes: 120
+    steps:
+      - name: Build, deploy, check health and notify Zalo
+        shell: bash
+        run: python3 /opt/dpl-ci/pipeline.py
